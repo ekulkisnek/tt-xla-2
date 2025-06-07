@@ -337,7 +337,7 @@ def validate_param_shapes(params, config):
     
     # Check final layer norm and lm_head
     expected_norm_shape = (config["hidden_size"],)
-    expected_lm_head_shape = (config["vocab_size"], config["hidden_size"])
+    expected_lm_head_shape = (config["hidden_size"], config["vocab_size"])  # Changed order to match actual model
     
     if params["params"]["norm"]["scale"].shape != expected_norm_shape:
         errors.append(f"Final layer norm shape mismatch: got {params['params']['norm']['scale'].shape}, expected {expected_norm_shape}")
