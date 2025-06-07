@@ -107,3 +107,9 @@ tests/jax/models/qwen25/qwen25-weights/merges.txt
 tests/jax/models/qwen25/qwen25-weights/model.safetensors.index.json
 tests/jax/models/qwen25/qwen25-weights/README.md
 tests/jax/models/qwen25/qwen25-weights/tokenizer_config.json
+tests/jax/models/qwen25/implementation/model_weights/model-00001-of-00004.safetensors
+tests/jax/models/qwen25/implementation/model_weights/model-00002-of-00004.safetensors
+tests/jax/models/qwen25/implementation/model_weights/model-00003-of-00004.safetensors
+tests/jax/models/qwen25/implementation/model_weights/
+tests/jax/models/qwen25/implementation/weights/
+tests/jax/models/qwen25/weights/
