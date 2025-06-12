@@ -45,23 +45,65 @@ class QwenAttention(nn.Module):
         self.max_position_embeddings = c.get("max_position_embeddings", 4096)
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, cos=None, sin=None):
         batch, seq, _ = hidden_states.shape
+        
+        # Project current hidden states
         q = self.q_proj(hidden_states).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
-        # Rotary
+        
+        # Apply rotary embeddings
         if position_ids is not None:
             if cos is None or sin is None:
                 cos, sin = compute_cos_sin_cache(position_ids, self.head_dim, self.rope_theta)
             q, k = apply_rotary_emb(q, k, cos, sin)
-        # GQA: repeat k/v if needed
+        
+        # Handle past key-value cache
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            
+            # Ensure past cache is in the same format as current k,v: [batch, seq, num_kv_heads, head_dim]
+            if past_k.shape[1] == self.num_kv_heads and past_k.shape[2] != self.num_kv_heads:
+                # Past cache is in transposed format [batch, num_kv_heads, seq, head_dim], transpose it back
+                past_k = jnp.transpose(past_k, (0,2,1,3))
+                past_v = jnp.transpose(past_v, (0,2,1,3))
+            
+            # Convert past cache to KV head format if needed
+            if past_k.shape[2] == self.num_heads:  # If past cache is in query head format
+                # Reshape to group query heads into KV heads
+                past_k = past_k.reshape(batch, -1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
+                past_k = jnp.mean(past_k, axis=3)  # Average over query heads per KV head
+                past_v = past_v.reshape(batch, -1, self.num_kv_heads, self.num_heads // self.num_kv_heads, self.head_dim)
+                past_v = jnp.mean(past_v, axis=3)
+            elif past_k.shape[0] == 0 or past_k.shape[1] == 0:  # Empty cache
+                past_k = jnp.zeros((batch, 0, self.num_kv_heads, self.head_dim), dtype=past_k.dtype)
+                past_v = jnp.zeros((batch, 0, self.num_kv_heads, self.head_dim), dtype=past_v.dtype)
+            elif past_k.shape[2] != self.num_kv_heads:  # Unexpected head count
+                raise ValueError(f"Past cache has unexpected number of heads: {past_k.shape[2]}, expected {self.num_kv_heads}")
+            
+            # Concatenate along sequence dimension
+            k = jnp.concatenate([past_k, k], axis=1)
+            v = jnp.concatenate([past_v, v], axis=1)
+            
+            # After concatenation, ensure sequence dimension matches
+            if k.shape[1] > seq:
+                k = k[:, -seq:, :, :]
+                v = v[:, -seq:, :, :]
+        
+        # Store cache before repeating (should be in KV head format)
+        cache_k = k
+        cache_v = v
+        
+        # GQA: repeat k/v to match query heads for attention computation
         if self.num_heads != self.num_kv_heads:
             repeat = self.num_heads // self.num_kv_heads
             k = jnp.repeat(k, repeat, axis=2)
             v = jnp.repeat(v, repeat, axis=2)
+        
         # Transpose for attention: [b, h, s, d]
-        q = jnp.transpose(q, (0,2,1,3))
-        k = jnp.transpose(k, (0,2,1,3))
-        v = jnp.transpose(v, (0,2,1,3))
+        q = jnp.transpose(q, (0,2,1,3))  # [batch, num_heads, seq, head_dim]
+        k = jnp.transpose(k, (0,2,1,3))  # [batch, num_heads, seq, head_dim]
+        v = jnp.transpose(v, (0,2,1,3))  # [batch, num_heads, seq, head_dim]
+        
         # Attention
         scale = 1.0 / np.sqrt(self.head_dim)
         attn_scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
@@ -70,7 +112,9 @@ class QwenAttention(nn.Module):
         attn_probs = jax.nn.softmax(attn_scores, axis=-1)
         attn_out = jnp.einsum('bhqk,bhkd->bhqd', attn_probs, v)
         attn_out = jnp.transpose(attn_out, (0,2,1,3)).reshape(batch, seq, self.hidden_size)
-        return self.o_proj(attn_out)
+        
+        # Return both output and updated cache (in same format as input: [batch, seq, num_kv_heads, head_dim])
+        return self.o_proj(attn_out), (cache_k, cache_v)
 
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=10000.0):
     # position_ids: [batch, seq]
@@ -117,9 +161,9 @@ class QwenDecoderLayer(nn.Module):
     def setup(self):
         c = self.config
         self.hidden_size = c["hidden_size"]
-        self.input_layernorm = nn.LayerNorm(epsilon=c.get("layer_norm_epsilon", 1e-5), dtype=self.dtype, use_bias=False, name="input_layernorm")
+        self.input_layernorm = nn.RMSNorm(epsilon=c.get("layer_norm_epsilon", 1e-5), dtype=self.dtype, name="input_layernorm")
         self.self_attn = QwenAttention(config=c, dtype=self.dtype)
-        self.post_attention_layernorm = nn.LayerNorm(epsilon=c.get("layer_norm_epsilon", 1e-5), dtype=self.dtype, use_bias=False, name="post_attention_layernorm")
+        self.post_attention_layernorm = nn.RMSNorm(epsilon=c.get("layer_norm_epsilon", 1e-5), dtype=self.dtype, name="post_attention_layernorm")
         self.mlp = QwenMLP(config=c, dtype=self.dtype)
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
@@ -132,7 +176,7 @@ class QwenDecoderLayer(nn.Module):
             position_ids = jnp.arange(seq)[None, :].repeat(batch, axis=0)
         cos, sin = compute_cos_sin_cache(position_ids, self.self_attn.head_dim, self.self_attn.rope_theta)
         
-        hidden_states = self.self_attn(
+        hidden_states, past_key_value = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -147,7 +191,7 @@ class QwenDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + self.mlp(hidden_states)
         
-        return hidden_states
+        return hidden_states, past_key_value
 
 class Qwen25ForCausalLM(nn.Module):
     config: Dict[str, Any]
@@ -159,7 +203,7 @@ class Qwen25ForCausalLM(nn.Module):
         self.num_layers = c["num_hidden_layers"]
         self.embed_tokens = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_size, dtype=self.dtype, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=self.dtype, name=f"layers_{i}") for i in range(self.num_layers)]
-        self.norm = nn.LayerNorm(epsilon=c.get("layer_norm_epsilon", 1e-5), dtype=self.dtype, use_bias=False, name="norm")
+        self.norm = nn.RMSNorm(epsilon=c.get("layer_norm_epsilon", 1e-5), dtype=self.dtype, name="norm")
         self.lm_head = nn.Dense(self.vocab_size, dtype=self.dtype, use_bias=False, name="lm_head")
 
     def __call__(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
@@ -167,28 +211,34 @@ class Qwen25ForCausalLM(nn.Module):
         if attention_mask is None:
             attention_mask = jnp.ones((batch, 1, 1, seq), dtype=self.dtype)
         
+        # Add causal masking to prevent attending to future tokens
+        causal_mask = jnp.triu(jnp.full((1,1,seq,seq), -jnp.inf), k=1)
+        attention_mask = jnp.logical_or(attention_mask, causal_mask)
+        
         hidden_states = self.embed_tokens(input_ids)
         
         # Initialize past key values if not provided
         if past_key_values is None:
             past_key_values = [None] * self.num_layers
-            
-        # Process each layer
+        
+        # Process each layer and collect new key-value caches
+        new_key_values = []
         for layer, past_key_value in zip(self.layers, past_key_values):
-            hidden_states = layer(
+            hidden_states, new_key_value = layer(
                 hidden_states, 
                 attention_mask=attention_mask, 
                 position_ids=position_ids,
                 past_key_value=past_key_value
             )
-            
+            new_key_values.append(new_key_value)
+        
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
         
         if return_dict:
             return {
                 "logits": logits,
-                "past_key_values": past_key_values
+                "past_key_values": new_key_values
             }
         return logits
 
