@@ -6,6 +6,9 @@ Self-contained, real Qwen2.5-7B inference script for single-device JAX.
 - Allows dtype selection (bfloat16/float32)
 - Cleans up memory after each run
 - No file output, no simplification, no external local imports
+
+Usage 
+python simple_inference.py --model_path ../weights --prompt "Hello, how are you?" --max_tokens 50 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
 """
 import os
 import sys
@@ -252,10 +255,10 @@ def get_param_path(name):
     if name in direct_mapping:
         return direct_mapping[name]
     import re
-    layer_norm_pattern = r"model\\.layers\\.(\\d+)\\.(input|post_attention)_layernorm\\.weight"
-    attention_pattern = r"model\\.layers\\.(\\d+)\\.self_attn\\.(q|k|v|o)_proj\\.(weight|bias)"
-    mlp_pattern = r"model\\.layers\\.(\\d+)\\.mlp\\.(gate|up|down)_proj\\.weight"
-    rotary_pattern = r"model\\.layers\\.(\\d+)\\.self_attn\\.rotary_emb\\..*"
+    layer_norm_pattern = r"model\.layers\.(\d+)\.(input|post_attention)_layernorm\.weight"
+    attention_pattern = r"model\.layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.(weight|bias)"
+    mlp_pattern = r"model\.layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight"
+    rotary_pattern = r"model\.layers\.(\d+)\.self_attn\.rotary_emb\..*"
     layer_norm_match = re.match(layer_norm_pattern, name)
     if layer_norm_match:
         layer_idx = int(layer_norm_match.group(1))
@@ -293,22 +296,51 @@ def transpose_if_needed(name, param):
 
 def process_safetensors_file(file_path, dtype=jnp.bfloat16):
     flax_params = {"params": {}}
+    unmapped_keys = []
+    
     with safe_open(file_path, framework="numpy") as f:
         for key in f.keys():
             param_path = get_param_path(key)
             if param_path is None:
+                unmapped_keys.append(key)
                 continue
+                
             param = f.get_tensor(key)
+            original_dtype = param.dtype
+            original_shape = param.shape
+            
+            # Handle dtype conversion safely
+            if original_dtype == np.float16 and dtype == jnp.bfloat16:
+                param = param.astype(np.float32)  # safer than direct bf16 conversion
+            
             param = jnp.array(param, dtype=dtype)
+            param_before_transpose = param
             param = transpose_if_needed(key, param)
+            
+            # Validate transpose worked as expected
+            if "weight" in key and ("proj" in key or "lm_head" in key):
+                if jnp.array_equal(param, param_before_transpose):
+                    logger.warning(f"Expected transpose for {key} but array unchanged")
+                else:
+                    # Quick checksum to catch double-transpose
+                    before_mean = jnp.mean(param_before_transpose[:min(2, param_before_transpose.shape[0]), :min(2, param_before_transpose.shape[1])])
+                    after_mean = jnp.mean(param[:min(2, param.shape[0]), :min(2, param.shape[1])])
+                    logger.debug(f"Transpose {key}: before_mean={float(before_mean):.6f}, after_mean={float(after_mean):.6f}")
+            
             current_dict = flax_params["params"]
             for path_part in param_path[:-1]:
                 if path_part not in current_dict:
                     current_dict[path_part] = {}
                 current_dict = current_dict[path_part]
             current_dict[param_path[-1]] = param
+            
+            logger.debug(f"Loaded {key} -> {'/'.join(param_path)}: {original_shape} {original_dtype} -> {param.shape} {param.dtype}")
             del param
             gc.collect()
+    
+    if unmapped_keys:
+        logger.info(f"Unmapped keys in {os.path.basename(file_path)}: {unmapped_keys}")
+    
     return flax_params
 
 def merge_param_dicts(base_dict, new_dict):
@@ -327,7 +359,7 @@ def load_params(model, model_path, dtype):
     
     # 1. Initialize full param tree with dummy input
     dummy_input = jnp.ones((1, 1), dtype=jnp.int32)
-    params = model.init(jax.random.PRNGKey(0), dummy_input)
+    init_params = model.init(jax.random.PRNGKey(0), dummy_input)
     
     # 2. Load weights from safetensors files
     param_dict = {}
@@ -341,16 +373,100 @@ def load_params(model, model_path, dtype):
     # 3. Map weights to model structure
     def map_params(params, param_dict):
         if isinstance(params, dict):
-            return {k: map_params(v, param_dict) for k, v in params.items()}
-        elif isinstance(params, (jnp.ndarray, np.ndarray)):
-            return params
-        else:
-            return params
+            out = {}
+            for k, v in params.items():
+                if k in param_dict:  # <- use loaded value if present
+                    out[k] = map_params(v, param_dict[k])
+                else:
+                    out[k] = v
+            return out
+        else:  # leaf – replace if we have it
+            return param_dict if isinstance(param_dict, (jnp.ndarray, np.ndarray)) else params
     
     # 4. Update initialized params with loaded weights
-    params = map_params(params, param_dict)
+    params = map_params(init_params, param_dict)
+    
+    # 5. Validation checks
+    logger.info("Validating loaded weights...")
+    
+    # Check that weights actually changed from initialization
+    init_embed_std = jnp.std(init_params['params']['embed_tokens']['embedding'])
+    loaded_embed_std = jnp.std(params['params']['embed_tokens']['embedding'])
+    logger.info(f"Embedding std - init: {float(init_embed_std):.6f}, loaded: {float(loaded_embed_std):.6f}")
+    
+    if abs(float(init_embed_std) - float(loaded_embed_std)) < 1e-6:
+        logger.warning("WARNING: Embedding weights appear unchanged from initialization!")
+    
+    # Count total parameters
+    def count_params(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        return sum(np.prod(leaf.shape) for leaf in leaves)
+    
+    total_params = count_params(params)
+    logger.info(f"Total parameters: {total_params:,} ({total_params/1e9:.2f}B)")
+    
+    # Check if embed_tokens and lm_head are tied (should be for Qwen 2.5)
+    embed_tokens = params['params']['embed_tokens']['embedding']
+    lm_head = params['params']['lm_head']['kernel']
+    
+    if embed_tokens.shape == lm_head.shape:
+        max_diff = jnp.max(jnp.abs(embed_tokens - lm_head))
+        logger.info(f"Embed↔LM-head tie check: max_diff = {float(max_diff):.2e}")
+        if float(max_diff) < 1e-6:
+            logger.info("✓ Weights are properly tied")
+        else:
+            logger.warning("✗ Weights are NOT tied (this may be expected)")
+    else:
+        logger.info(f"Embed shape: {embed_tokens.shape}, LM head shape: {lm_head.shape}")
     
     return params
+
+# --- Validation ---
+def validate_model_outputs(model, params, tokenizer, test_input=[1, 42, 600]):
+    """Run a simple forward pass to validate model outputs."""
+    logger.info("Running validation forward pass...")
+    
+    # Create test input
+    input_ids = jnp.array([test_input], dtype=jnp.int32)
+    batch_size, seq_length = input_ids.shape
+    
+    # Create attention mask
+    attention_mask = jnp.ones((batch_size, 1, 1, seq_length), dtype=jnp.int32)
+    position_ids = jnp.arange(seq_length, dtype=jnp.int32)[None, :]
+    
+    # Forward pass
+    outputs = model.apply(
+        params,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=None,
+        return_dict=True
+    )
+    
+    logits = outputs["logits"]
+    logger.info(f"Output logits shape: {logits.shape}")
+    logger.info(f"Logits range: [{float(jnp.min(logits)):.3f}, {float(jnp.max(logits)):.3f}]")
+    logger.info(f"Logits std: {float(jnp.std(logits)):.3f}")
+    
+    # Check for suspicious patterns
+    if jnp.any(jnp.isnan(logits)):
+        logger.error("ERROR: NaN values in logits!")
+    if jnp.any(jnp.isinf(logits)):
+        logger.error("ERROR: Infinite values in logits!")
+    
+    # Get top tokens for sanity check
+    top_tokens = jnp.argsort(logits[0, -1, :])[-10:][::-1]
+    logger.info(f"Top 10 tokens: {top_tokens.tolist()}")
+    
+    # Try to decode them
+    try:
+        top_token_texts = [tokenizer.decode([int(t)]) for t in top_tokens[:5]]
+        logger.info(f"Top 5 token texts: {top_token_texts}")
+    except Exception as e:
+        logger.warning(f"Could not decode top tokens: {e}")
+    
+    return logits
 
 # --- Generation ---
 def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
@@ -511,9 +627,12 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     # Load weights
-    logger.info("Loading weights...")
     params = load_params(model, args.model_path, dtype)
     gc.collect(); jax.clear_caches()
+    
+    # Validate model
+    validate_model_outputs(model, params, tokenizer)
+    
     # Generate
     logger.info("Generating text...")
     generate_text(model, params, tokenizer, args.prompt, args.max_tokens, args.temperature, args.top_p, args.top_k)
