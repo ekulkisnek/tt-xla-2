@@ -8,7 +8,7 @@ Self-contained, real Qwen2.5-7B inference script for single-device JAX.
 - No file output, no simplification, no external local imports
 
 Usage 
-python simple_inference.py --model_path ../weights --prompt "Hello, how are you?" --max_tokens 50 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
+python simple_inference.py --model_path ../weights --prompt "Hello, how are you?" --max_tokens 20 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
 """
 import os
 import sys
@@ -421,6 +421,19 @@ def load_params(model, model_path, dtype):
     
     # 4. Update initialized params with loaded weights
     params = map_params(init_params, param_dict)
+    
+    # 4.5. Fix LM-head weight tying (after transpose is applied)
+    # DISABLED: This fix improves numerical metrics but degrades generation quality
+    # embed_tokens = params['params']['embed_tokens']['embedding']
+    # lm_head = params['params']['lm_head']['kernel']
+    # 
+    # # For Qwen2.5, lm_head should be tied to embedding weights (transposed)
+    # if embed_tokens.shape == (lm_head.shape[1], lm_head.shape[0]):
+    #     # Shapes are compatible for transpose tying
+    #     params['params']['lm_head']['kernel'] = embed_tokens.T
+    #     logger.info("✓ LM-head weights tied to embedding weights (transposed)")
+    # else:
+    #     logger.warning(f"⚠️ Cannot tie weights: embed_shape={embed_tokens.shape}, lm_head_shape={lm_head.shape}")
     
     # 5. Validation checks
     logger.info("Validating loaded weights...")
