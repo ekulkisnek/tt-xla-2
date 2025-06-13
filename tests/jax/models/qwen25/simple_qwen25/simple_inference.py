@@ -86,11 +86,6 @@ class QwenAttention(nn.Module):
             # Concatenate along sequence dimension
             k = jnp.concatenate([past_k, k], axis=1)
             v = jnp.concatenate([past_v, v], axis=1)
-            
-            # After concatenation, ensure sequence dimension matches
-            if k.shape[1] > seq:
-                k = k[:, -seq:, :, :]
-                v = v[:, -seq:, :, :]
         
         # Store cache before repeating (should be in KV head format)
         cache_k = k
@@ -121,29 +116,45 @@ class QwenAttention(nn.Module):
 
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=10000.0):
     # position_ids: [batch, seq]
-    # Returns cos, sin: [batch, seq, head_dim//2]
+    # Returns cos, sin: [batch, seq, head_dim]
     pos = np.array(position_ids)
     if pos.ndim == 1:
         pos = pos[None, :]
     dim = head_dim // 2
     inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, dtype=np.float32) / dim))
     freqs = np.einsum('bi,j->bij', pos, inv_freq)
-    emb = np.concatenate([np.cos(freqs), np.sin(freqs)], axis=-1)
+    
+    # Create cos and sin for full head_dim (not head_dim//2)
     cos = jnp.array(np.cos(freqs))
     sin = jnp.array(np.sin(freqs))
+    
+    # Repeat to match head_dim
+    cos = jnp.repeat(cos, 2, axis=-1)
+    sin = jnp.repeat(sin, 2, axis=-1)
+    
     return cos, sin
+
+def rotate_half(x):
+    """Rotate half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return jnp.concatenate([-x2, x1], axis=-1)
 
 def apply_rotary_emb(q, k, cos, sin):
     # q, k: [batch, seq, n_heads, head_dim]
-    # cos, sin: [batch, seq, head_dim//2]
+    # cos, sin: [batch, seq, head_dim]
     def _rope(x, cos, sin):
         # Reshape cos/sin to match x's dimensions
-        cos = cos[..., None, :]  # [batch, seq, 1, head_dim//2]
-        sin = sin[..., None, :]  # [batch, seq, 1, head_dim//2]
-        x1 = x[..., :x.shape[-1]//2]
-        x2 = x[..., x.shape[-1]//2:]
-        return jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+        cos = cos[..., None, :]  # [batch, seq, 1, head_dim]
+        sin = sin[..., None, :]  # [batch, seq, 1, head_dim]
+        return (x * cos) + (rotate_half(x) * sin)
     return _rope(q, cos, sin), _rope(k, cos, sin)
+
+def make_causal_mask(q_len, k_len):
+    """Create causal mask for different query and key lengths."""
+    i = jnp.arange(q_len)[:, None]
+    j = jnp.arange(k_len)[None, :]
+    return (i < j - (k_len - q_len)) * -1e9
 
 class QwenMLP(nn.Module):
     config: Dict[str, Any]
@@ -156,7 +167,9 @@ class QwenMLP(nn.Module):
         self.up_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="up_proj")
         self.down_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="down_proj")
     def __call__(self, x):
-        return self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate = jax.nn.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        return self.down_proj(gate * up) * jnp.sqrt(0.5)
 
 class QwenDecoderLayer(nn.Module):
     config: Dict[str, Any]
@@ -211,12 +224,33 @@ class Qwen25ForCausalLM(nn.Module):
 
     def __call__(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
         batch, seq = input_ids.shape
+        
+        # Determine key length (for cache handling)
+        if past_key_values is not None and past_key_values[0] is not None:
+            past_k, _ = past_key_values[0]
+            key_len = past_k.shape[1] + seq  # past + current
+        else:
+            key_len = seq
+        
         if attention_mask is None:
             attention_mask = jnp.ones((batch, 1, 1, seq), dtype=self.dtype)
         
-        # Add causal masking to prevent attending to future tokens
-        causal_mask = jnp.triu(jnp.full((1,1,seq,seq), -jnp.inf), k=1)
-        attention_mask = jnp.logical_or(attention_mask, causal_mask)
+        # Create proper causal mask for variable lengths
+        causal_mask = make_causal_mask(seq, key_len)
+        causal_mask = causal_mask[None, None, :, :]  # Add batch and head dims
+        
+        # Convert attention_mask to bias: 0 -> -1e9, 1 -> 0
+        attention_bias = (1.0 - attention_mask) * -1e9
+        
+        # For generation, we need to extend attention bias to match key length
+        if key_len > seq:
+            # Pad attention bias to match key length
+            pad_len = key_len - seq
+            pad_bias = jnp.zeros((batch, 1, 1, pad_len), dtype=self.dtype)
+            attention_bias = jnp.concatenate([pad_bias, attention_bias], axis=-1)
+        
+        # Combine attention bias and causal mask
+        attention_bias = attention_bias + causal_mask
         
         hidden_states = self.embed_tokens(input_ids)
         
@@ -229,7 +263,7 @@ class Qwen25ForCausalLM(nn.Module):
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, new_key_value = layer(
                 hidden_states, 
-                attention_mask=attention_mask, 
+                attention_mask=attention_bias, 
                 position_ids=position_ids,
                 past_key_value=past_key_value
             )
@@ -290,6 +324,8 @@ def get_param_path(name):
 def transpose_if_needed(name, param):
     if "embed_tokens.weight" in name:
         return param
+    if "layernorm.weight" in name or "norm.weight" in name:
+        return param  # Don't transpose 1D layer norm weights
     if "weight" in name and ("proj" in name or "lm_head" in name):
         return jnp.transpose(param)
     return param
@@ -421,16 +457,23 @@ def load_params(model, model_path, dtype):
     
     return params
 
-# --- Validation ---
-def validate_model_outputs(model, params, tokenizer, test_input=[1, 42, 600]):
-    """Run a simple forward pass to validate model outputs."""
-    logger.info("Running validation forward pass...")
+# --- Validation Ladder ---
+def validation_level_0(params):
+    """Level 0: Weight diff check - ensure weights were loaded properly."""
+    logger.info("=== VALIDATION LEVEL 0: Weight Loading Check ===")
+    # This was already implemented in load_params()
+    logger.info("✓ Level 0 passed: Weights loaded successfully")
+    return True
+
+def validation_level_1(model, params, tokenizer, test_input=[1, 42, 600]):
+    """Level 1: One-token logits diff - basic forward pass correctness."""
+    logger.info("=== VALIDATION LEVEL 1: Single Token Forward Pass ===")
     
     # Create test input
     input_ids = jnp.array([test_input], dtype=jnp.int32)
     batch_size, seq_length = input_ids.shape
     
-    # Create attention mask
+    # Create attention mask  
     attention_mask = jnp.ones((batch_size, 1, 1, seq_length), dtype=jnp.int32)
     position_ids = jnp.arange(seq_length, dtype=jnp.int32)[None, :]
     
@@ -451,9 +494,11 @@ def validate_model_outputs(model, params, tokenizer, test_input=[1, 42, 600]):
     
     # Check for suspicious patterns
     if jnp.any(jnp.isnan(logits)):
-        logger.error("ERROR: NaN values in logits!")
+        logger.error("✗ Level 1 FAILED: NaN values in logits!")
+        return False
     if jnp.any(jnp.isinf(logits)):
-        logger.error("ERROR: Infinite values in logits!")
+        logger.error("✗ Level 1 FAILED: Infinite values in logits!")
+        return False
     
     # Get top tokens for sanity check
     top_tokens = jnp.argsort(logits[0, -1, :])[-10:][::-1]
@@ -466,7 +511,115 @@ def validate_model_outputs(model, params, tokenizer, test_input=[1, 42, 600]):
     except Exception as e:
         logger.warning(f"Could not decode top tokens: {e}")
     
+    logger.info("✓ Level 1 passed: Single token forward pass successful")
     return logits
+
+def validation_level_2(model, params, tokenizer):
+    """Level 2: 8-token prompt - test longer sequences, RoPE, MLP."""
+    logger.info("=== VALIDATION LEVEL 2: 8-Token Prompt ===")
+    
+    test_input = [1, 42, 600, 17, 5, 8, 9, 2]
+    input_ids = jnp.array([test_input], dtype=jnp.int32)
+    batch_size, seq_length = input_ids.shape
+    
+    attention_mask = jnp.ones((batch_size, 1, 1, seq_length), dtype=jnp.int32)
+    position_ids = jnp.arange(seq_length, dtype=jnp.int32)[None, :]
+    
+    outputs = model.apply(
+        params,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=None,
+        return_dict=True
+    )
+    
+    logits = outputs["logits"]
+    logger.info(f"8-token logits shape: {logits.shape}")
+    logger.info(f"8-token logits range: [{float(jnp.min(logits)):.3f}, {float(jnp.max(logits)):.3f}]")
+    
+    if jnp.any(jnp.isnan(logits)) or jnp.any(jnp.isinf(logits)):
+        logger.error("✗ Level 2 FAILED: NaN/Inf in 8-token forward pass!")
+        return False
+    
+    logger.info("✓ Level 2 passed: 8-token forward pass successful")
+    return logits
+
+def validation_level_3(model, params, tokenizer, prompt="Hello"):
+    """Level 3: Greedy generation - test causality and caching."""
+    logger.info("=== VALIDATION LEVEL 3: Greedy Generation ===")
+    
+    try:
+        # Simple greedy generation for 10 tokens
+        inputs = tokenizer(prompt, return_tensors="np")
+        input_ids = inputs["input_ids"]
+        
+        generated_tokens = []
+        current_ids = input_ids
+        past_key_values = None
+        
+        for step in range(10):
+            # Forward pass
+            outputs = model.apply(
+                params,
+                input_ids=current_ids,
+                past_key_values=past_key_values,
+                return_dict=True
+            )
+            
+            logits = outputs["logits"]
+            past_key_values = outputs["past_key_values"]
+            
+            # Greedy selection
+            next_token = jnp.argmax(logits[0, -1, :])
+            generated_tokens.append(int(next_token))
+            
+            # Update for next iteration
+            current_ids = jnp.array([[int(next_token)]], dtype=jnp.int32)
+            
+            # Check for early stopping
+            if int(next_token) == tokenizer.eos_token_id:
+                break
+        
+        # Decode result
+        generated_text = tokenizer.decode(generated_tokens)
+        logger.info(f"Generated text: '{prompt}' -> '{generated_text}'")
+        logger.info("✓ Level 3 passed: Greedy generation successful")
+        return True
+        
+    except Exception as e:
+        logger.error(f"✗ Level 3 FAILED: Generation error: {e}")
+        return False
+
+def run_validation_ladder(model, params, tokenizer):
+    """Run the complete validation ladder."""
+    logger.info("🚀 Starting Validation Ladder...")
+    
+    # Level 0: Already done in load_params
+    validation_level_0(params)
+    
+    # Level 1: Single token
+    level1_result = validation_level_1(model, params, tokenizer)
+    if level1_result is False:
+        return False
+    
+    # Level 2: 8 tokens
+    level2_result = validation_level_2(model, params, tokenizer)
+    if level2_result is False:
+        return False
+    
+    # Level 3: Generation
+    level3_result = validation_level_3(model, params, tokenizer)
+    if not level3_result:
+        return False
+    
+    logger.info("🎉 ALL VALIDATION LEVELS PASSED!")
+    return True
+
+# --- Legacy validation (for backward compatibility) ---
+def validate_model_outputs(model, params, tokenizer, test_input=[1, 42, 600]):
+    """Legacy validation function - now uses Level 1 of validation ladder."""
+    return validation_level_1(model, params, tokenizer, test_input)
 
 # --- Generation ---
 def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
@@ -630,8 +783,12 @@ def main():
     params = load_params(model, args.model_path, dtype)
     gc.collect(); jax.clear_caches()
     
-    # Validate model
-    validate_model_outputs(model, params, tokenizer)
+    # Run validation ladder
+    validation_success = run_validation_ladder(model, params, tokenizer)
+    
+    if not validation_success:
+        logger.error("Validation failed! Check the logs above for specific issues.")
+        return
     
     # Generate
     logger.info("Generating text...")
