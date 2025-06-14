@@ -1,0 +1,10 @@
+#!/bin/bash
+# JAX environment setup for memory-efficient CPU inference
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export JAX_NUM_GENEROUS_MEMORY_BLOCKS=0
+export OMP_NUM_THREADS=8
+
+echo "JAX environment configured:"
+echo "  XLA_PYTHON_CLIENT_PREALLOCATE=${XLA_PYTHON_CLIENT_PREALLOCATE}"
+echo "  JAX_NUM_GENEROUS_MEMORY_BLOCKS=${JAX_NUM_GENEROUS_MEMORY_BLOCKS}"
+echo "  OMP_NUM_THREADS=${OMP_NUM_THREADS}" 
