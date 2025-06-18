@@ -117,16 +117,16 @@ class QwenAttention(nn.Module):
 def compute_cos_sin_cache(position_ids, head_dim, rope_theta=10000.0):
     # position_ids: [batch, seq]
     # Returns cos, sin: [batch, seq, head_dim]
-    pos = np.array(position_ids)
+    pos = position_ids
     if pos.ndim == 1:
         pos = pos[None, :]
     dim = head_dim // 2
-    inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, dtype=np.float32) / dim))
-    freqs = np.einsum('bi,j->bij', pos, inv_freq)
+    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim))
+    freqs = jnp.einsum('bi,j->bij', pos.astype(jnp.float32), inv_freq)
     
     # Create cos and sin for full head_dim (not head_dim//2)
-    cos = jnp.array(np.cos(freqs))
-    sin = jnp.array(np.sin(freqs))
+    cos = jnp.cos(freqs)
+    sin = jnp.sin(freqs)
     
     # Repeat to match head_dim
     cos = jnp.repeat(cos, 2, axis=-1)
