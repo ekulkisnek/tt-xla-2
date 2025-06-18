@@ -70,6 +70,15 @@ def main(args):
     greedy = build_greedy_fn(model)
     print(f"    done in {time.time()-t0:.1f}s")
 
+    # Warm up JIT compilation with a dummy call
+    print("🔹 Warming up JAX compilation...")
+    dummy_ids = np.array([[1, 2, 3]], dtype=np.int32)
+    try:
+        _, _ = greedy(params, dummy_ids, None)
+        print("    JIT compilation completed")
+    except Exception as e:
+        print(f"    Warmup failed: {e}")
+
     # 4. Optional PyTorch baseline -------------------------------------------
     torch_model, torch_tok = build_torch_baseline(not args.no_torch)
 
@@ -77,6 +86,9 @@ def main(args):
     correct = both_match = 0
     for idx in indices:
         ex = test[idx]
+        
+        print(f"\n📝 Problem {idx}: {ex['question'][:80]}...")
+        
         # Use a simpler prompt format that works better with the model
         prompt = f"{ex['question']}\n\nSolution:"
         # JAX forward ---------------------------------------------------------
@@ -84,50 +96,78 @@ def main(args):
         collected = []
         pkv = None  # Start with None, model will handle initialization
         
+        gen_start = time.time()
+        timeout_per_step = 2.0  # Max 2 seconds per token
+        
         for step in range(args.max_steps):
+            step_start = time.time()
             try:
                 next_id, pkv = greedy(params, input_ids, pkv)
                 next_id = int(next_id[0])
                 collected.append(next_id)
                 input_ids = np.array([[next_id]], dtype=np.int32)
                 
-                # Optional debug output
-                # if step < 5:
-                #     token_text = tok.decode([next_id])
-                #     print(f"Step {step}: token_id={next_id}, text={repr(token_text)}")
+                step_time = time.time() - step_start
+                if step_time > timeout_per_step:
+                    print(f"⚠️ Step {step} took {step_time:.1f}s (timeout)")
                 
-                if tok.decode([next_id]).endswith("####") or next_id == tok.eos_token_id:
-                    print(f"Stopping at step {step}: EOS or #### found")
+                # Show progress every 20 tokens
+                if step % 20 == 0 and step > 0:
+                    partial_text = tok.decode(collected[-20:])
+                    print(f"    Step {step}: ...{partial_text}")
+                
+                # Check for stopping conditions
+                token_text = tok.decode([next_id])
+                if token_text.endswith("####") or next_id == tok.eos_token_id:
+                    print(f"✓ Stopped at step {step}: found #### or EOS")
                     break
+                    
+                # Emergency brake: if generation is taking too long
+                total_time = time.time() - gen_start
+                if total_time > 60:  # Max 1 minute per problem
+                    print(f"⚠️ Generation timeout after {total_time:.1f}s")
+                    break
+                    
             except Exception as e:
-                print(f"Error during generation: {e}")
+                print(f"❌ Error at step {step}: {e}")
                 break
+        
+        gen_time = time.time() - gen_start
+        print(f"⏱️ Generated {len(collected)} tokens in {gen_time:.1f}s ({len(collected)/gen_time:.1f} tok/s)")
+        
         jax_txt = tok.decode(collected)
         jax_ans = extract_num(jax_txt)
         gold    = ex["answer"].split("####")[1].strip()
         jax_ok  = (jax_ans == gold)
         if jax_ok: correct += 1
-        
-        # Debug output
-        print(f"Generated text: {repr(jax_txt[:200])}...")
-        print(f"Question: {ex['question'][:100]}...")
+
+        # Show a sample of the generated text
+        print(f"📄 Generated: {jax_txt[:150]}...")
+        if "####" in jax_txt:
+            answer_part = jax_txt.split("####")[-1][:50]
+            print(f"🎯 Found answer section: {answer_part}")
 
         # PyTorch parity ------------------------------------------------------
         if torch_model:
+            print("🔄 Running PyTorch baseline...")
+            torch_start = time.time()
             t_txt = torch_answer(torch_model, torch_tok, prompt, args.max_steps)
             t_ans = extract_num(t_txt)
             both_match += int(jax_ans == t_ans)
+            torch_time = time.time() - torch_start
+            print(f"⏱️ PyTorch took {torch_time:.1f}s")
 
         # Report single line --------------------------------------------------
         flag = "✅" if jax_ok else "❌"
-        print(f"{flag}  idx={idx:<4}  gold={gold:<6}  jax={jax_ans}  "
-              f"{'(torch '+t_ans+')' if torch_model else ''}")
+        print(f"{flag} idx={idx:<4} gold={gold:<6} jax={jax_ans} "
+              f"{'(torch='+str(t_ans)+')' if torch_model else ''}")
 
     # 6. Summary --------------------------------------------------------------
     n = len(indices)
-    print(f"\nJAX accuracy {correct}/{n}  ({100*correct/n:.1f} %)")
+    print(f"\n🏆 FINAL RESULTS:")
+    print(f"JAX accuracy: {correct}/{n} ({100*correct/n:.1f}%)")
     if torch_model:
-        print(f"JAX == PyTorch on {both_match}/{n}")
+        print(f"JAX==PyTorch: {both_match}/{n}")
 
 # ---------- CLI ----------
 if __name__ == "__main__":
@@ -140,8 +180,8 @@ if __name__ == "__main__":
                    help="Start index if using --count (default 0)")
     p.add_argument("--indices", type=str, default="",
                    help="Comma-separated list of explicit indices (overrides --count/--offset)")
-    p.add_argument("--max_steps", type=int, default=256,
-                   help="Decoder budget per problem before giving up")
+    p.add_argument("--max_steps", type=int, default=64,
+                   help="Decoder budget per problem before giving up (reduced default)")
     p.add_argument("--no_torch", action="store_true",
                    help="Skip PyTorch baseline (saves RAM/time)")
     main(p.parse_args()) 
