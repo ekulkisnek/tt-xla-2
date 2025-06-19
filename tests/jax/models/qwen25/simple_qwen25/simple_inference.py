@@ -655,7 +655,7 @@ def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
         # Create mask for non-top-k values
         logits_mask = jnp.full_like(logits, True)
         top_k_one_hot = jax.nn.one_hot(top_k_indices, vocab_size, dtype=bool)
-        top_k_mask = jnp.logical_or.reduce(top_k_one_hot, axis=-2)
+        top_k_mask = jnp.any(top_k_one_hot, axis=-2)
         
         # Apply mask to logits
         logits = jnp.where(

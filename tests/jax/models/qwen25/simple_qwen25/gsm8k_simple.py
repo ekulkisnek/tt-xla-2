@@ -10,10 +10,10 @@ def extract_num(txt: str):
     m = re.search(r"####\s*(-?\d+)", txt)
     return m.group(1) if m else None
 
-def simple_generate(model, params, tokenizer, prompt, max_tokens=60):
-    """Simple greedy generation - exact copy of validation_level_3 logic"""
+def simple_generate(model, params, tokenizer, prompt, max_tokens=256):
+    """Simple greedy generation - exact copy of validation_level_3 with longer max_tokens"""
     try:
-        # Simple greedy generation for max_tokens
+        # Simple greedy generation - match validation_level_3 exactly
         inputs = tokenizer(prompt, return_tensors="np")
         input_ids = inputs["input_ids"]
         
@@ -22,10 +22,19 @@ def simple_generate(model, params, tokenizer, prompt, max_tokens=60):
         past_key_values = None
         
         for step in range(max_tokens):
-            # Forward pass - same as validation_level_3
+            # Create position_ids for longer generation (this is what validation_level_3 is missing)
+            if step == 0:
+                # First step: positions start from 0
+                position_ids = np.arange(current_ids.shape[1], dtype=np.int32)[None, :]
+            else:
+                # Subsequent steps: increment position
+                position_ids = np.array([[position_ids[0, -1] + 1]], dtype=np.int32)
+            
+            # Forward pass with position_ids for RoPE
             outputs = model.apply(
                 params,
                 input_ids=current_ids,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 return_dict=True
             )
@@ -44,11 +53,9 @@ def simple_generate(model, params, tokenizer, prompt, max_tokens=60):
             if int(next_token) == tokenizer.eos_token_id:
                 break
                 
-            # Check if we found the answer marker
-            if step > 5:  # Wait a few tokens
-                recent_text = tokenizer.decode(generated_tokens[-10:])
-                if "####" in recent_text:
-                    break
+            # Check if we found the answer marker - stop after #### appears
+            if "####" in tokenizer.decode(generated_tokens):
+                break
         
         # Decode result
         generated_text = tokenizer.decode(generated_tokens)
@@ -121,5 +128,5 @@ if __name__ == "__main__":
     p.add_argument("--count", type=int, default=1)
     p.add_argument("--offset", type=int, default=None)
     p.add_argument("--indices", type=str, default="")
-    p.add_argument("--max_tokens", type=int, default=60)
+    p.add_argument("--max_tokens", type=int, default=256)
     main(p.parse_args()) 
