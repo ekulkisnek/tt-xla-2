@@ -89,6 +89,7 @@ qwen2.5-weights/
 
 
 
+
 tests/jax/models/qwen25-weights/model-00001-of-00004.safetensors
 tests/jax/models/qwen25-weights/model-00003-of-00004.safetensors
 tests/jax/models/qwen25-weights/model-00002-of-00004.safetensors
@@ -113,3 +114,5 @@ tests/jax/models/qwen25/implementation/model_weights/model-00003-of-00004.safete
 tests/jax/models/qwen25/implementation/model_weights/
 tests/jax/models/qwen25/implementation/weights/
 tests/jax/models/qwen25/weights/
+tests/jax/models/qwen25/instruct_weights/model-00001-of-00004.safetensors
+tests/jax/models/qwen25/instruct_weights/

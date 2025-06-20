@@ -112,18 +112,26 @@ class QwenAttention(nn.Module):
         self.num_kv_heads = c.get("num_key_value_heads", self.num_heads)
         self.kv_dim = self.num_kv_heads * self.head_dim
         
-        # Roadmap Rule: q_proj, k_proj, v_proj → P(None, "model")
-        self.q_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
-                                        use_bias=False, shard_axes=(None, "model"), name="q_proj")
-        self.k_proj = TensorParallelDense(features=self.kv_dim, dtype=self.dtype, 
-                                        use_bias=False, shard_axes=(None, "model"), name="k_proj")
-        self.v_proj = TensorParallelDense(features=self.kv_dim, dtype=self.dtype, 
-                                        use_bias=False, shard_axes=(None, "model"), name="v_proj")
-        # Roadmap Rule: o_proj → P("model", None)
-        self.o_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
-                                        use_bias=False, shard_axes=("model", None), name="o_proj")
+        # Use standard Dense for single device, TensorParallelDense for multi-device
+        if len(jax.devices()) == 1:
+            # Single device mode - use standard Dense layers like working q25_jax.py
+            self.q_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="q_proj")
+            self.k_proj = nn.Dense(self.kv_dim, dtype=self.dtype, use_bias=False, name="k_proj")
+            self.v_proj = nn.Dense(self.kv_dim, dtype=self.dtype, use_bias=False, name="v_proj")
+            self.o_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="o_proj")
+        else:
+            # Multi-device mode - use TensorParallelDense
+            self.q_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
+                                            use_bias=False, shard_axes=(None, "model"), name="q_proj")
+            self.k_proj = TensorParallelDense(features=self.kv_dim, dtype=self.dtype, 
+                                            use_bias=False, shard_axes=(None, "model"), name="k_proj")
+            self.v_proj = TensorParallelDense(features=self.kv_dim, dtype=self.dtype, 
+                                            use_bias=False, shard_axes=(None, "model"), name="v_proj")
+            self.o_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
+                                            use_bias=False, shard_axes=("model", None), name="o_proj")
         
         self.rope_theta = c.get("rope_theta", 10000.0)
+        self.max_position_embeddings = c.get("max_position_embeddings", 4096)
         
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, cos=None, sin=None):
         batch, seq, _ = hidden_states.shape
@@ -198,14 +206,20 @@ class QwenMLP(nn.Module):
         self.hidden_size = c["hidden_size"]
         self.intermediate_size = c.get("intermediate_size", 4 * self.hidden_size)
         
-        # Roadmap Rule: gate_proj, up_proj → P(None, "model")
-        self.gate_proj = TensorParallelDense(features=self.intermediate_size, dtype=self.dtype, 
-                                           use_bias=False, shard_axes=(None, "model"), name="gate_proj")
-        self.up_proj = TensorParallelDense(features=self.intermediate_size, dtype=self.dtype, 
-                                         use_bias=False, shard_axes=(None, "model"), name="up_proj")
-        # Roadmap Rule: down_proj → P("model", None)
-        self.down_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
-                                           use_bias=False, shard_axes=("model", None), name="down_proj")
+        # Use standard Dense for single device, TensorParallelDense for multi-device
+        if len(jax.devices()) == 1:
+            # Single device mode - use standard Dense layers like working q25_jax.py
+            self.gate_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="gate_proj")
+            self.up_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="up_proj")
+            self.down_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="down_proj")
+        else:
+            # Multi-device mode - use TensorParallelDense
+            self.gate_proj = TensorParallelDense(features=self.intermediate_size, dtype=self.dtype, 
+                                               use_bias=False, shard_axes=(None, "model"), name="gate_proj")
+            self.up_proj = TensorParallelDense(features=self.intermediate_size, dtype=self.dtype, 
+                                             use_bias=False, shard_axes=(None, "model"), name="up_proj")
+            self.down_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
+                                               use_bias=False, shard_axes=("model", None), name="down_proj")
     
     def __call__(self, x):
         gate = jax.nn.silu(self.gate_proj(x))
