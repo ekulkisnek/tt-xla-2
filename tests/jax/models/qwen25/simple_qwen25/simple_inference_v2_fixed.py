@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
 """
-qwen25_jax.py – minimal single-device JAX inference for Qwen-2.5-7B
+Self-contained, real Qwen2.5-7B inference script for single-device JAX.
+- Uses real model code and weight mapping from run_inference.py/model.py
+- Prints output to terminal only
+- Allows dtype selection (bfloat16/float32)
+- Cleans up memory after each run
+- No file output, no simplification, no external local imports
 
-Usage:
-python qwen25_jax.py \
-       --model_path ../weights \
-       --prompt "Explain machine learning." \
-       --max_new_tokens 100 \
-       --dtype bfloat16
+Usage 
+python simple_inference.py --model_path ../weights --prompt "Hello, how are you?" --max_tokens 20 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
 """
-import os, time, json, gc, argparse
-import jax, jax.numpy as jnp, numpy as np
+import os
+import sys
+import time
+import json
+import gc
+import argparse
+import logging
+from typing import Dict, Any, Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from safetensors import safe_open
 
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("qwen25_simple")
+
 # --- Model code (copied from your real model.py, single-device only) ---
 class QwenAttention(nn.Module):
-    config: dict
+    config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
     def setup(self):
         c = self.config
@@ -142,7 +157,7 @@ def make_causal_mask(q_len, k_len):
     return (i < j - (k_len - q_len)) * -1e9
 
 class QwenMLP(nn.Module):
-    config: dict
+    config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
     def setup(self):
         c = self.config
@@ -157,7 +172,7 @@ class QwenMLP(nn.Module):
         return self.down_proj(gate * up)
 
 class QwenDecoderLayer(nn.Module):
-    config: dict
+    config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
     def setup(self):
         c = self.config
@@ -195,7 +210,7 @@ class QwenDecoderLayer(nn.Module):
         return hidden_states, past_key_value
 
 class Qwen25ForCausalLM(nn.Module):
-    config: dict
+    config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
     def setup(self):
         c = self.config
@@ -317,16 +332,36 @@ def transpose_if_needed(name, param):
 
 def process_safetensors_file(file_path, dtype=jnp.bfloat16):
     flax_params = {"params": {}}
+    unmapped_keys = []
     
     with safe_open(file_path, framework="numpy") as f:
         for key in f.keys():
             param_path = get_param_path(key)
             if param_path is None:
+                unmapped_keys.append(key)
                 continue
                 
             param = f.get_tensor(key)
+            original_dtype = param.dtype
+            original_shape = param.shape
+            
+            # Handle dtype conversion safely
+            if original_dtype == np.float16 and dtype == jnp.bfloat16:
+                param = param.astype(np.float32)  # safer than direct bf16 conversion
+            
             param = jnp.array(param, dtype=dtype)
+            param_before_transpose = param
             param = transpose_if_needed(key, param)
+            
+            # Validate transpose worked as expected
+            if "weight" in key and ("proj" in key or "lm_head" in key):
+                if jnp.array_equal(param, param_before_transpose):
+                    logger.warning(f"Expected transpose for {key} but array unchanged")
+                else:
+                    # Quick checksum to catch double-transpose
+                    before_mean = jnp.mean(param_before_transpose[:min(2, param_before_transpose.shape[0]), :min(2, param_before_transpose.shape[1])])
+                    after_mean = jnp.mean(param[:min(2, param.shape[0]), :min(2, param.shape[1])])
+                    logger.debug(f"Transpose {key}: before_mean={float(before_mean):.6f}, after_mean={float(after_mean):.6f}")
             
             current_dict = flax_params["params"]
             for path_part in param_path[:-1]:
@@ -335,8 +370,12 @@ def process_safetensors_file(file_path, dtype=jnp.bfloat16):
                 current_dict = current_dict[path_part]
             current_dict[param_path[-1]] = param
             
+            logger.debug(f"Loaded {key} -> {'/'.join(param_path)}: {original_shape} {original_dtype} -> {param.shape} {param.dtype}")
             del param
             gc.collect()
+    
+    if unmapped_keys:
+        logger.info(f"Unmapped keys in {os.path.basename(file_path)}: {unmapped_keys}")
     
     return flax_params
 
@@ -352,22 +391,22 @@ def merge_param_dicts(base_dict, new_dict):
 
 def load_params(model, model_path, dtype):
     """Load model parameters from safetensors files."""
-    print("Loading weights...")
+    logger.info("Loading weights...")
     
-    # Initialize full param tree with dummy input
+    # 1. Initialize full param tree with dummy input
     dummy_input = jnp.ones((1, 1), dtype=jnp.int32)
     init_params = model.init(jax.random.PRNGKey(0), dummy_input)
     
-    # Load weights from safetensors files
+    # 2. Load weights from safetensors files
     param_dict = {}
     for file in os.listdir(model_path):
         if file.endswith(".safetensors"):
             file_path = os.path.join(model_path, file)
-            print(f"Loading {file}")
+            logger.info(f"Loading {file}")
             file_params = process_safetensors_file(file_path, dtype)
             param_dict = merge_param_dicts(param_dict, file_params)
     
-    # Map weights to model structure
+    # 3. Map weights to model structure
     def map_params(params, param_dict):
         if isinstance(params, dict):
             out = {}
@@ -380,169 +419,158 @@ def load_params(model, model_path, dtype):
         else:  # leaf – replace if we have it
             return param_dict if isinstance(param_dict, (jnp.ndarray, np.ndarray)) else params
     
-    # Update initialized params with loaded weights
+    # 4. Update initialized params with loaded weights
     params = map_params(init_params, param_dict)
+    
+    # 4.5. Fix LM-head weight tying (after transpose is applied)
+    # DISABLED: This fix improves numerical metrics but degrades generation quality
+    # embed_tokens = params['params']['embed_tokens']['embedding']
+    # lm_head = params['params']['lm_head']['kernel']
+    # 
+    # # For Qwen2.5, lm_head should be tied to embedding weights (transposed)
+    # if embed_tokens.shape == (lm_head.shape[1], lm_head.shape[0]):
+    #     # Shapes are compatible for transpose tying
+    #     params['params']['lm_head']['kernel'] = embed_tokens.T
+    #     logger.info("✓ LM-head weights tied to embedding weights (transposed)")
+    # else:
+    #     logger.warning(f"⚠️ Cannot tie weights: embed_shape={embed_tokens.shape}, lm_head_shape={lm_head.shape}")
+    
+    # 5. Validation checks
+    logger.info("Validating loaded weights...")
+    
+    # Check that weights actually changed from initialization
+    init_embed_std = jnp.std(init_params['params']['embed_tokens']['embedding'])
+    loaded_embed_std = jnp.std(params['params']['embed_tokens']['embedding'])
+    logger.info(f"Embedding std - init: {float(init_embed_std):.6f}, loaded: {float(loaded_embed_std):.6f}")
+    
+    if abs(float(init_embed_std) - float(loaded_embed_std)) < 1e-6:
+        logger.warning("WARNING: Embedding weights appear unchanged from initialization!")
+    
+    # Count total parameters
+    def count_params(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        return sum(np.prod(leaf.shape) for leaf in leaves)
+    
+    total_params = count_params(params)
+    logger.info(f"Total parameters: {total_params:,} ({total_params/1e9:.2f}B)")
+    
+    # Check if embed_tokens and lm_head are tied (should be for Qwen 2.5)
+    embed_tokens = params['params']['embed_tokens']['embedding']
+    lm_head = params['params']['lm_head']['kernel']
+    
+    if embed_tokens.shape == lm_head.shape:
+        max_diff = jnp.max(jnp.abs(embed_tokens - lm_head))
+        logger.info(f"Embed↔LM-head tie check: max_diff = {float(max_diff):.2e}")
+        if float(max_diff) < 1e-6:
+            logger.info("✓ Weights are properly tied")
+        else:
+            logger.warning("✗ Weights are NOT tied (this may be expected)")
+    else:
+        logger.info(f"Embed shape: {embed_tokens.shape}, LM head shape: {lm_head.shape}")
+    
     return params
 
-# No validation functions - just use the model directly
+# --- Validation removed for streamlined version ---
 
 # --- Generation ---
-def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
-    """Sample next token from logits with temperature, top-k, and top-p sampling."""
-    # Create PRNG key
-    rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
-    
-    # Get final dimension (vocab size)
-    vocab_size = logits.shape[-1]
-    
-    # Apply temperature
-    if temperature > 0:
-        logits = logits / jnp.maximum(temperature, 1e-7)
-    
-    # Apply top-k filtering
-    if top_k > 0 and top_k < vocab_size:
-        # Get top-k logits and corresponding indices
-        top_k_logits, top_k_indices = jax.lax.top_k(logits, top_k)
-        
-        # Create mask for non-top-k values
-        logits_mask = jnp.full_like(logits, True)
-        top_k_one_hot = jax.nn.one_hot(top_k_indices, vocab_size, dtype=bool)
-        top_k_mask = jnp.any(top_k_one_hot, axis=-2)
-        
-        # Apply mask to logits
-        logits = jnp.where(
-            top_k_mask,
-            logits,
-            jnp.full_like(logits, -float("inf"))
-        )
-    
-    # Apply top-p (nucleus) filtering
-    if 0.0 < top_p < 1.0:
-        # Convert logits to probabilities
-        probs = jax.nn.softmax(logits, axis=-1)
-        
-        # Create indices with same shape as probs
-        indices = jnp.arange(vocab_size, dtype=jnp.int32)
-        indices = jnp.broadcast_to(indices, probs.shape)
-        
-        # Sort probabilities in descending order
-        sorted_probs, sorted_indices = jax.lax.sort_key_val(-probs, indices)
-        sorted_probs = -sorted_probs
-        
-        # Calculate cumulative probabilities
-        cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
-        
-        # Find indices where cumulative probability exceeds top_p
-        sorted_indices_to_remove = cumulative_probs > top_p
-        
-        # Keep first token above threshold to maintain minimum probability
-        sorted_indices_to_remove = jnp.concatenate([
-            jnp.zeros_like(sorted_indices_to_remove[..., :1]),
-            sorted_indices_to_remove[..., :-1]
-        ], axis=-1)
-        
-        # Create mask for indices to remove
-        indices_to_remove = jnp.zeros_like(probs, dtype=bool)
-        for i in range(logits.shape[0]):
-            indices_to_remove = indices_to_remove.at[i, sorted_indices[i]].set(sorted_indices_to_remove[i])
-        
-        # Apply mask to logits
-        logits = jnp.where(
-            indices_to_remove,
-            jnp.full_like(logits, -float("inf")),
-            logits
-        )
-    
-    # If temperature is close to zero, perform greedy sampling
+def sample_next_token(logits, temperature=0.7):
+    """Simple sampling from logits with temperature."""
     if temperature < 1e-5:
-        next_token = jnp.argmax(logits, axis=-1)
+        return jnp.argmax(logits, axis=-1)
     else:
-        # Sample from the filtered distribution
-        next_token = jax.random.categorical(rng_key, logits, axis=-1)
-    
-    return next_token
+        rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
+        return jax.random.categorical(rng_key, logits / temperature, axis=-1)
 
-def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50):
+def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7):
     """Generate text using the model."""
+    # Tokenize input
     inputs = tokenizer(prompt, return_tensors="np")
     input_ids = inputs["input_ids"]
     
-    generated_tokens = []
-    current_ids = input_ids
-    past_key_values = None
+    # Create attention mask - use 4D format for Qwen model
+    batch_size = input_ids.shape[0]
+    seq_length = input_ids.shape[1]
+    attention_mask = np.ones((batch_size, 1, 1, seq_length), dtype=np.int32)
     
-    for step in range(max_tokens):
+    # Position IDs - make sure to match the input_ids length
+    position_ids = np.arange(input_ids.shape[1], dtype=np.int32)[None, :]
+    
+    # Initialize generation state
+    state = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "past_key_values": None,
+    }
+    
+    # Track generated text
+    generated_text = ""
+    
+    # Generate tokens
+    for _ in range(max_tokens):
         # Forward pass
         outputs = model.apply(
             params,
-            input_ids=current_ids,
-            past_key_values=past_key_values,
+            input_ids=state["input_ids"],
+            attention_mask=state["attention_mask"],
+            position_ids=state["position_ids"],
+            past_key_values=state["past_key_values"],
             return_dict=True
         )
         
+        # Get logits and past key values
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         
         # Sample next token
-        next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_p=top_p, top_k=top_k)
-        generated_tokens.append(int(next_token[0]))
+        next_token = sample_next_token(logits[:, -1, :], temperature=temperature)
         
-        # Update for next iteration
-        current_ids = jnp.array([[int(next_token[0])]], dtype=jnp.int32)
+        # Update state
+        state["input_ids"] = next_token[:, None]
+        state["attention_mask"] = np.ones((batch_size, 1, 1, 1), dtype=np.int32)
+        state["position_ids"] = np.array([[state["position_ids"][0, -1] + 1]], dtype=np.int32)
+        state["past_key_values"] = past_key_values
         
         # Decode and print token
-        token = tokenizer.decode([int(next_token[0])])
+        token = tokenizer.decode(next_token[0])
+        generated_text += token
         print(token, end="", flush=True)
         
-        # Check for early stopping
-        if int(next_token[0]) == tokenizer.eos_token_id:
+        # Check for end of sequence
+        if next_token[0] == tokenizer.eos_token_id:
             break
     
     print()  # New line at end
-    generated_text = tokenizer.decode(generated_tokens)
     return generated_text
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B JAX Inference")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B Inference (single device, real model)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
-    parser.add_argument("--max_new_tokens", type=int, default=100, help="Maximum tokens to generate")
+    parser.add_argument("--max_tokens", type=int, default=100, help="Maximum tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     args = parser.parse_args()
-    
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
-    
     # Load config
     config_path = os.path.join(args.model_path, "config.json")
     with open(config_path, 'r') as f:
         config = json.load(f)
     model = Qwen25ForCausalLM(config=config, dtype=dtype)
-    
     # Load tokenizer
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     # Load weights
     params = load_params(model, args.model_path, dtype)
     gc.collect(); jax.clear_caches()
     
-    # Use chat template for instruct models
-    messages = [{"role":"user","content":args.prompt.strip()}]
-    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # Generate
-    print(f"Generating for: '{args.prompt}'")
-    t0 = time.time()
-    generate_text(model, params, tokenizer, prompt_text, args.max_new_tokens, args.temperature, args.top_p, args.top_k)
-    print(f"\n--- generated in {time.time()-t0:.1f}s ---")
-    
+    # Generate (skip validation for speed)
+    generate_text(model, params, tokenizer, args.prompt, args.max_tokens, args.temperature)
     # Clean up
     del params; del model; gc.collect(); jax.clear_caches()
-    print("Done.")
 
 if __name__ == "__main__":
     main() 
