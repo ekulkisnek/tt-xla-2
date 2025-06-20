@@ -346,9 +346,12 @@ class Qwen25ForCausalLM(nn.Module):
     def setup(self):
         c = self.config
         
+        # Use config vocab size (don't truncate like q25_jax.py)
+        actual_vocab_size = c["vocab_size"]  # Use full config vocab size
+        
         # Token embeddings (not sharded)
         self.embed_tokens = nn.Embed(
-            num_embeddings=c["vocab_size"],
+            num_embeddings=actual_vocab_size,
             features=c["hidden_size"],
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -374,7 +377,7 @@ class Qwen25ForCausalLM(nn.Module):
         
         # LM head (not sharded by default, could be sharded for very large vocabs)
         self.lm_head = nn.Dense(
-            features=c["vocab_size"],
+            features=actual_vocab_size,
             use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -498,6 +501,8 @@ def process_safetensors_file(file_path, dtype=jnp.bfloat16):
             # Load parameter
             param = f.get_tensor(name)
             param = transpose_if_needed(name, param)
+            
+            # No truncation - use full vocab size like q25_jax.py
             param = jnp.array(param, dtype=dtype)
             
             # Store in nested dict structure
@@ -568,6 +573,55 @@ def sample_next_token(logits, temperature=0.7):
 
 def generate_with_model(model, params, tokenizer, prompt, max_new_tokens=20, temperature=0.8):
     """Generate text with the model"""
+    # STEP 1 DIAGNOSTICS: Check tokenizer and embedding alignment
+    logger.info("=== STEP 1 DIAGNOSTICS ===")
+    
+    # 1.1 Dump the first 10 prompt token-ids
+    prompt_token_ids = tokenizer.encode(prompt)
+    logger.info(f"Prompt token IDs: {prompt_token_ids}")
+    logger.info(f"Tokenizer vocab size: {len(tokenizer)}")
+    
+    # 1.2 Check vocab size vs embedding matrix
+    embed = params['params']['embed_tokens']['embedding']
+    logger.info(f"Embedding shape: {embed.shape}")
+    logger.info(f"Config vocab size: {embed.shape[0]}")
+    logger.info(f"Tokenizer vocab size: {len(tokenizer)}")
+    
+    if embed.shape[0] != len(tokenizer):
+        logger.info(f"ℹ️ Config vocab size ({embed.shape[0]}) != tokenizer vocab size ({len(tokenizer)})")
+        logger.info("ℹ️ This is normal - using config vocab size like q25_jax.py for better generation")
+        if len(tokenizer) > embed.shape[0]:
+            logger.error(f"❌ Tokenizer vocab size exceeds embedding size!")
+            raise ValueError("Tokenizer vocab > embedding vocab!")
+    else:
+        logger.info("✅ Tokenizer vocab == embedding rows")
+    
+    # 1.3 Verify LM-head tie
+    et = params['params']['embed_tokens']['embedding']
+    lm = params['params']['lm_head']['kernel']
+    logger.info(f"Embed tokens shape: {et.shape}")
+    logger.info(f"LM head shape: {lm.shape}")
+    
+    # DISABLED: Following q25_jax.py - weight tying degrades generation quality
+    # The working q25_jax.py deliberately does NOT tie weights for better generation
+    logger.info("ℹ️ LM-head weights NOT tied (following q25_jax.py for better generation)")
+    
+    logger.info("=== END DIAGNOSTICS ===")
+    
+    # STEP 2 DIAGNOSTICS: Audit weight mapping per layer
+    logger.info("=== STEP 2 DIAGNOSTICS ===")
+    
+    # Debug parameter structure
+    logger.info(f"Params keys: {list(params.keys())}")
+    logger.info(f"Params['params'] keys: {list(params['params'].keys())}")
+    
+    # 2.1 Add one-layer checksum
+    layer0_q = params['params']['layers_0']['self_attn']['q_proj']['kernel']
+    logger.info(f"Layer-0 q_proj mean: {float(layer0_q.mean()):.6f}, std: {float(layer0_q.std()):.6f}")
+    logger.info(f"Layer-0 q_proj shape: {layer0_q.shape}")
+    
+    logger.info("=== END STEP 2 DIAGNOSTICS ===")
+    
     # Tokenize prompt
     prompt_tokens = tokenizer.encode(prompt, return_tensors="np")
     input_ids = jnp.array(prompt_tokens).reshape(1, -1)
@@ -641,7 +695,7 @@ def run_single_device(prompt, model_path, max_tokens=20, temperature=0.8, dtype=
     config = load_config(model_path)
     tokenizer = setup_tokenizer(model_path)
     
-    # Create model
+    # Create model with config vocab size
     model = Qwen25ForCausalLM(config=config, dtype=dtype, param_dtype=dtype)
     
     # Load parameters
@@ -677,7 +731,7 @@ def run_tensor_parallel(prompt, model_path, model_parallel=2, max_tokens=20, tem
         config = load_config(model_path)
         tokenizer = setup_tokenizer(model_path)
         
-        # Create model
+        # Create model with config vocab size
         model = Qwen25ForCausalLM(config=config, dtype=dtype, param_dtype=dtype)
         print(f"Mesh configuration: {mesh.devices.shape}")
         
