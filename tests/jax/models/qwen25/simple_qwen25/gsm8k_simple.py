@@ -11,54 +11,68 @@ def extract_num(txt: str):
     return m.group(1) if m else None
 
 def simple_generate(model, params, tokenizer, prompt, max_tokens=256):
-    """Simple greedy generation - exact copy of validation_level_3 with longer max_tokens"""
+    """High-quality greedy generation - uses same logic as simple_inference.py but greedy"""
     try:
-        # Simple greedy generation - match validation_level_3 exactly
+        # Tokenize input (same as simple_inference.py)
         inputs = tokenizer(prompt, return_tensors="np")
         input_ids = inputs["input_ids"]
         
-        generated_tokens = []
-        current_ids = input_ids
-        past_key_values = None
+        # Create attention mask - use 4D format for Qwen model (CRITICAL!)
+        batch_size = input_ids.shape[0]
+        seq_length = input_ids.shape[1]
+        attention_mask = np.ones((batch_size, 1, 1, seq_length), dtype=np.int32)
         
-        for step in range(max_tokens):
-            # Create position_ids for longer generation (this is what validation_level_3 is missing)
-            if step == 0:
-                # First step: positions start from 0
-                position_ids = np.arange(current_ids.shape[1], dtype=np.int32)[None, :]
-            else:
-                # Subsequent steps: increment position
-                position_ids = np.array([[position_ids[0, -1] + 1]], dtype=np.int32)
-            
-            # Forward pass with position_ids for RoPE
+        # Position IDs - make sure to match the input_ids length
+        position_ids = np.arange(input_ids.shape[1], dtype=np.int32)[None, :]
+        
+        # Initialize generation state (same as simple_inference.py)
+        state = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": None,
+        }
+        
+        # Track generated text
+        generated_text = ""
+        
+        # Generate tokens (same logic as simple_inference.py)
+        for _ in range(max_tokens):
+            # Forward pass
             outputs = model.apply(
                 params,
-                input_ids=current_ids,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
+                input_ids=state["input_ids"],
+                attention_mask=state["attention_mask"],
+                position_ids=state["position_ids"],
+                past_key_values=state["past_key_values"],
                 return_dict=True
             )
             
+            # Get logits and past key values
             logits = outputs["logits"]
             past_key_values = outputs["past_key_values"]
             
-            # Greedy selection
-            next_token = jnp.argmax(logits[0, -1, :])
-            generated_tokens.append(int(next_token))
+            # Greedy selection (temperature=0 equivalent)
+            next_token = jnp.argmax(logits[:, -1, :], axis=-1)
             
-            # Update for next iteration
-            current_ids = jnp.array([[int(next_token)]], dtype=jnp.int32)
+            # Update state (same as simple_inference.py)
+            state["input_ids"] = next_token[:, None]
+            state["attention_mask"] = np.ones((batch_size, 1, 1, 1), dtype=np.int32)
+            state["position_ids"] = np.array([[state["position_ids"][0, -1] + 1]], dtype=np.int32)
+            state["past_key_values"] = past_key_values
+            
+            # Decode token
+            token = tokenizer.decode(next_token[0])
+            generated_text += token
             
             # Check for early stopping
-            if int(next_token) == tokenizer.eos_token_id:
+            if next_token[0] == tokenizer.eos_token_id:
                 break
                 
             # Check if we found the answer marker - stop after #### appears
-            if "####" in tokenizer.decode(generated_tokens):
+            if "####" in generated_text:
                 break
         
-        # Decode result
-        generated_text = tokenizer.decode(generated_tokens)
         return generated_text
         
     except Exception as e:
