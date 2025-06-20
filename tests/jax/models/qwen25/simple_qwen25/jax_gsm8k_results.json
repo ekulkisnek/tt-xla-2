@@ -1,0 +1,16 @@
+[
+  {
+    "correct": false,
+    "expected": 72,
+    "extracted": null,
+    "time": 39.57794785499573,
+    "response": "To solve this step-by-step, let requires understanding involves a specific number, we need to clarify the specific numbers, and and"
+  },
+  {
+    "correct": false,
+    "expected": 10,
+    "extracted": null,
+    "time": 4.39726448059082,
+    "response": "Let"
+  }
+]

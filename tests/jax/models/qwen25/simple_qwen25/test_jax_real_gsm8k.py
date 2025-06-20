@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Final working GSM8K test with Qwen2.5-7B-Instruct 
-Uses the fixes from the repair manual: causal mask fix, numerical stability, etc.
+Test JAX Qwen2.5-7B-Instruct on REAL GSM8K problems with full generation
+Mirror of the PyTorch test but using JAX implementation
 """
 import sys
 sys.path.append('.')
-from q25_jax_instruct import Qwen25ForCausalLM, load_params
+from q25_jax_instruct import Qwen25ForCausalLM, load_params, apply_chat_template
 from transformers import AutoTokenizer
 import jax
 import jax.numpy as jnp
@@ -15,7 +15,7 @@ import re
 import time
 
 def extract_answer(text):
-    """Extract numerical answer from text."""
+    """Extract numerical answer from generated text"""
     # More comprehensive patterns for GSM8K
     patterns = [
         r"the answer is (\d+)",
@@ -43,10 +43,17 @@ def extract_answer(text):
     
     return None
 
-def simple_greedy_generate(model, params, tokenizer, prompt, max_tokens=250):
-    """Simple greedy generation with all the fixes applied."""
+def jax_generate_with_chat_template(model, params, tokenizer, question, max_tokens=200):
+    """Generate response using JAX model with chat template like PyTorch version"""
     try:
-        inputs = tokenizer(prompt, return_tensors="np")
+        # Use instruct chat template - same as PyTorch version
+        messages = [{"role": "user", "content": f"Solve this math problem step by step:\n\n{question}\n\nShow your work and clearly state the final answer."}]
+        
+        # Apply chat template using the function from q25_jax_instruct
+        formatted_prompt = apply_chat_template(tokenizer, messages)
+        
+        # Tokenize input
+        inputs = tokenizer(formatted_prompt, return_tensors="np")
         input_ids = inputs["input_ids"]
         
         batch_size, seq_length = input_ids.shape
@@ -55,15 +62,15 @@ def simple_greedy_generate(model, params, tokenizer, prompt, max_tokens=250):
         
         state = {
             "input_ids": input_ids,
-            "attention_mask": attention_mask, 
+            "attention_mask": attention_mask,
             "position_ids": position_ids,
             "past_key_values": None,
         }
         
         generated_text = ""
-        recent_tokens = []
         
         for i in range(max_tokens):
+            # Forward pass
             outputs = model.apply(
                 params,
                 input_ids=state["input_ids"],
@@ -76,25 +83,13 @@ def simple_greedy_generate(model, params, tokenizer, prompt, max_tokens=250):
             logits = outputs["logits"]
             past_key_values = outputs["past_key_values"]
             
-            # Numerical stability and clipping (from repair manual)
+            # Greedy sampling with numerical stability
             logits_stable = jnp.clip(logits[:, -1, :].astype(jnp.float32), -50.0, 50.0)
             next_token = jnp.argmax(logits_stable, axis=-1)
-            
-            # Convert to int immediately (repair manual section 8)
             token_id = int(next_token[0])
             
             # Stop on EOS
             if token_id == tokenizer.eos_token_id:
-                break
-                
-            # Track for repetition detection
-            recent_tokens.append(token_id)
-            if len(recent_tokens) > 5:
-                recent_tokens.pop(0)
-                
-            # Stop on excessive repetition
-            if len(recent_tokens) >= 3 and len(set(recent_tokens[-3:])) == 1:
-                print("Stopping due to repetition")
                 break
             
             # Decode token
@@ -105,15 +100,11 @@ def simple_greedy_generate(model, params, tokenizer, prompt, max_tokens=250):
                 # Skip problematic tokens
                 pass
             
-            # Update state
+            # Update state for next iteration
             state["input_ids"] = jnp.array([[token_id]], dtype=jnp.int32)
             state["attention_mask"] = jnp.ones((batch_size, 1, 1, 1), dtype=jnp.int32)
             state["position_ids"] = jnp.array([[state["position_ids"][0, -1] + 1]], dtype=jnp.int32)
             state["past_key_values"] = past_key_values
-            
-            # Early stopping on answer patterns - but give more tokens for complete reasoning
-            if ("####" in generated_text or "answer is" in generated_text.lower()) and i > 20:
-                break
         
         return generated_text.strip()
         
@@ -121,56 +112,56 @@ def simple_greedy_generate(model, params, tokenizer, prompt, max_tokens=250):
         print(f"Generation error: {e}")
         return ""
 
-def test_real_gsm8k_problems():
-    """Test with 2 real GSM8K problems."""
+def test_jax_real_gsm8k():
+    print("🔥 Testing JAX Qwen2.5-7B-INSTRUCT on Real GSM8K")
+    print("="*70)
+    
     model_path = "../instruct_weights"
     
-    print("🔹 Loading Qwen2.5-7B-Instruct...")
-    config_path = os.path.join(model_path, "config.json")
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    print(f"📥 Loading JAX model from: {model_path}")
     
-    model = Qwen25ForCausalLM(config=config, dtype=jnp.bfloat16)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    params = load_params(model, model_path, jnp.bfloat16)
+    # Load model
+    try:
+        config_path = os.path.join(model_path, "config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        model = Qwen25ForCausalLM(config=config, dtype=jnp.float32)  # Use float32 for better precision
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        params = load_params(model, model_path, jnp.float32)
+        
+        print("✅ JAX INSTRUCT model loaded")
+        
+    except Exception as e:
+        print(f"❌ JAX loading failed: {e}")
+        return
     
-    # Use proper chat template format like PyTorch
-    questions = [
+    # Same real GSM8K problems as PyTorch test - but only first 2
+    problems = [
         {
             "question": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
-            "expected": 72,
-            "name": "Natalia clips problem"
+            "answer": 72
         },
         {
             "question": "Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?",
-            "expected": 10, 
-            "name": "Weng babysitting problem"
+            "answer": 10
         }
     ]
     
-    test_cases = []
-    for q in questions:
-        # Apply proper chat template like PyTorch
-        messages = [{"role": "user", "content": f"Solve this math problem step by step:\n\n{q['question']}\n\nShow your work and clearly state the final answer."}]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        test_cases.append({
-            "prompt": prompt,
-            "expected": q["expected"],
-            "name": q["name"]
-        })
-    
     results = []
     
-    for i, test in enumerate(test_cases):
-        print(f"\n{'='*60}")
-        print(f"🧮 TEST {i+1}: {test['name']}")
-        print(f"{'='*60}")
-        print(f"Problem: {test['prompt']}")
-        print(f"Expected: {test['expected']}")
+    for i, problem in enumerate(problems):
+        print(f"\n{'='*70}")
+        print(f"🧮 Problem {i+1}/2")
+        print(f"{'='*70}")
+        print(f"Question: {problem['question']}")
+        print(f"Expected Answer: {problem['answer']}")
         
-        # Generate answer with timing
+        # Generate with more tokens for complete reasoning
         start_time = time.time()
-        response = simple_greedy_generate(model, params, tokenizer, test['prompt'], max_tokens=250)
+        response = jax_generate_with_chat_template(
+            model, params, tokenizer, problem['question'], max_tokens=200
+        )
         generation_time = time.time() - start_time
         
         print(f"\n🤖 Generated Response:")
@@ -180,41 +171,45 @@ def test_real_gsm8k_problems():
         print(f"⏱️  Generation time: {generation_time:.1f}s")
         
         # Extract answer
-        predicted = extract_answer(response)
-        print(f"Extracted answer: {predicted}")
+        extracted = extract_answer(response)
+        correct = extracted == problem['answer']
         
-        # Check if correct
-        is_correct = predicted == test['expected']
+        print(f"\n📊 Analysis:")
+        print(f"  Extracted Answer: {extracted}")
+        print(f"  Expected Answer: {problem['answer']}")
+        print(f"  Result: {'✅ CORRECT' if correct else '❌ INCORRECT'}")
+        
         results.append({
-            'correct': is_correct,
-            'expected': test['expected'],
-            'extracted': predicted,
-            'time': generation_time,
-            'response': response
+            'problem': i+1,
+            'question': problem['question'],
+            'expected': problem['answer'],
+            'generated': response,
+            'extracted': extracted,
+            'correct': correct,
+            'time': generation_time
         })
-        
-        print(f"Result: {'✅ CORRECT' if is_correct else '❌ INCORRECT'}")
     
-    # Final summary
+    # Summary
     correct_count = sum(1 for r in results if r['correct'])
     total_count = len(results)
     avg_time = sum(r['time'] for r in results) / len(results)
     
-    print(f"\n{'='*60}")
-    print(f"🏆 JAX FINAL RESULTS: {correct_count}/{total_count} ({100*correct_count/total_count:.1f}%)")
+    print(f"\n{'='*70}")
+    print(f"🏆 JAX FINAL RESULTS")
+    print(f"{'='*70}")
+    print(f"Score: {correct_count}/{total_count} ({correct_count/total_count*100:.1f}%)")
     print(f"Average generation time: {avg_time:.1f}s per problem")
-    print(f"{'='*60}")
-    
-    for i, r in enumerate(results, 1):
+    print(f"\nProblem-by-problem:")
+    for r in results:
         status = "✅" if r['correct'] else "❌"
-        print(f"  Problem {i}: {status} Expected {r['expected']}, Got {r['extracted']} ({r['time']:.1f}s)")
+        print(f"  {r['problem']}: {status} Expected {r['expected']}, Got {r['extracted']} ({r['time']:.1f}s)")
     
-    # Save results
-    with open('jax_gsm8k_results.json', 'w') as f:
+    # Save results for comparison with PyTorch
+    with open('jax_real_gsm8k_results.json', 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"\n💾 Results saved to jax_gsm8k_results.json")
+    print(f"\n💾 Results saved to jax_real_gsm8k_results.json")
     
-    return correct_count, total_count
+    return results
 
 if __name__ == "__main__":
-    test_real_gsm8k_problems() 
+    test_jax_real_gsm8k() 
