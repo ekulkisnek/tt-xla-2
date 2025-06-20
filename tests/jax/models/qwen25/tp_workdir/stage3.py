@@ -52,7 +52,14 @@ class TensorParallelDense(nn.Module):
     
     @nn.compact
     def __call__(self, x):
-        # Stage 3: Implement real split-K matmul with sharding constraints
+        # Check if we're in mesh context
+        try:
+            # Try to detect mesh context
+            mesh_context = len(jax.devices()) > 1 and hasattr(jax.sharding, 'current_mesh') 
+        except:
+            mesh_context = False
+        
+        # Stage 3: Implement real split-K matmul with sharding constraints ONLY if mesh exists
         kernel = self.param(
             "kernel",
             nn.initializers.lecun_normal(),
@@ -60,22 +67,27 @@ class TensorParallelDense(nn.Module):
             self.dtype,
         )
         
-        # Apply sharding constraints according to your checklist
-        kernel = jax.lax.with_sharding_constraint(kernel, P(None, "model"))
-        x = jax.lax.with_sharding_constraint(x, P("data", None))
-        
-        # Each GPU produces its slice
-        y_part = jnp.matmul(x, kernel)
-        
-        # For layers that need all-reduce (attention o_proj, MLP down_proj)
-        if self.reduce_scatter:
-            y = jax.lax.psum(y_part, axis_name="model")
+        if mesh_context:
+            # Apply sharding constraints according to your checklist
+            kernel = jax.lax.with_sharding_constraint(kernel, P(None, "model"))
+            x = jax.lax.with_sharding_constraint(x, P("data", None))
+            
+            # Each GPU produces its slice
+            y_part = jnp.matmul(x, kernel)
+            
+            # For layers that need all-reduce (attention o_proj, MLP down_proj)
+            if self.reduce_scatter:
+                y = jax.lax.psum(y_part, axis_name="model")
+            else:
+                y = y_part  # Leave split for now (testing)
         else:
-            y = y_part  # Leave split for now (testing)
+            # Stage 1: Just do normal Dense computation (no sharding)
+            y = jnp.matmul(x, kernel)
         
         if self.use_bias:
             bias = self.param("bias", nn.initializers.zeros, (self.features,), self.dtype)
-            bias = jax.lax.with_sharding_constraint(bias, P("model",))
+            if mesh_context:
+                bias = jax.lax.with_sharding_constraint(bias, P("model",))
             y = y + bias
         
         return y
@@ -99,7 +111,7 @@ class QwenAttention(nn.Module):
         self.v_proj = TensorParallelDense(features=self.kv_dim, dtype=self.dtype, 
                                         use_bias=False, reduce_scatter=False)
         self.o_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
-                                        use_bias=False, reduce_scatter=True)
+                                        use_bias=False, reduce_scatter=False)  # Stage 3 Step 2: Disable reduce first
         self.rope_theta = c.get("rope_theta", 10000.0)
         self.max_position_embeddings = c.get("max_position_embeddings", 4096)
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, cos=None, sin=None):
@@ -219,9 +231,13 @@ class QwenMLP(nn.Module):
         c = self.config
         self.hidden_size = c["hidden_size"]
         self.intermediate_size = c.get("intermediate_size", 4 * self.hidden_size)
-        self.gate_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="gate_proj")
-        self.up_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="up_proj")
-        self.down_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="down_proj")
+        # Stage 3: Use TensorParallelDense for MLP projections
+        self.gate_proj = TensorParallelDense(features=self.intermediate_size, dtype=self.dtype, 
+                                           use_bias=False, reduce_scatter=False)
+        self.up_proj = TensorParallelDense(features=self.intermediate_size, dtype=self.dtype, 
+                                         use_bias=False, reduce_scatter=False)
+        self.down_proj = TensorParallelDense(features=self.hidden_size, dtype=self.dtype, 
+                                           use_bias=False, reduce_scatter=False)  # Stage 3 Step 2: Disable reduce first
     def __call__(self, x):
         gate = jax.nn.silu(self.gate_proj(x))
         up = self.up_proj(x)
@@ -386,7 +402,7 @@ def transpose_if_needed(name, param):
         return jnp.transpose(param)
     return param
 
-def process_safetensors_file(file_path, dtype=jnp.bfloat16):
+def process_safetensors_file(file_path, dtype=jnp.bfloat16, mesh=None):
     flax_params = {"params": {}}
     unmapped_keys = []
     
@@ -445,7 +461,7 @@ def merge_param_dicts(base_dict, new_dict):
             base_dict[key] = value
     return base_dict
 
-def load_params(model, model_path, dtype):
+def load_params(model, model_path, dtype, mesh=None):
     """Load model parameters from safetensors files."""
     logger.info("Loading weights...")
     
@@ -459,7 +475,7 @@ def load_params(model, model_path, dtype):
         if file.endswith(".safetensors"):
             file_path = os.path.join(model_path, file)
             logger.info(f"Loading {file}")
-            file_params = process_safetensors_file(file_path, dtype)
+            file_params = process_safetensors_file(file_path, dtype, mesh)
             param_dict = merge_param_dicts(param_dict, file_params)
     
     # 3. Map weights to model structure
@@ -623,7 +639,7 @@ def main():
     # Stage 1 vs Stage 2 branching
     if args.tp == 1:
         logger.info("Stage 1: Single device mode")
-        params = load_params(model, args.model_path, dtype)
+        params = load_params(model, args.model_path, dtype, mesh=None)
         gc.collect(); jax.clear_caches()
         
         # Generate (Stage 1)
@@ -632,19 +648,26 @@ def main():
         # Clean up Stage 1
         del params; del model; gc.collect(); jax.clear_caches()
     else:
-        logger.info(f"Stage 2: Multi-device mode with TP={args.tp}")
+        logger.info(f"Stage 3: Multi-device mode with TP={args.tp}")
         mesh = create_mesh(model_parallel=args.tp, data_parallel=1)
         logger.info(f"Created mesh: {mesh.devices.shape} with axes {mesh.axis_names}")
         
-        # Stage 2 test: mesh.axis_names == ('data','model')
+        # Stage 3 test: mesh.axis_names == ('data','model')
         assert mesh.axis_names == ('data', 'model'), f"Wrong axis names: {mesh.axis_names}"
-        logger.info("✓ Stage 2 mesh creation test passed")
+        logger.info("✓ Stage 3 mesh creation test passed")
         
-        # For now, Stage 2 just validates mesh creation without full inference
-        logger.info("✓ Stage 2 validation passed - mesh creation successful")
+        # Stage 3: Load parameters with mesh and test split-K matmul
+        with mesh:
+            with jax.named_scope("model"):
+                # Load params under mesh context 
+                params = load_params(model, args.model_path, dtype, mesh=mesh)
+                
+                # Stage 3 Test: Generate one token to test split maths
+                logger.info("Stage 3: Testing split-K matmul with mesh...")
+                generate_text(model, params, tokenizer, args.prompt, args.max_tokens, args.temperature)
         
-        # Clean up Stage 2
-        del model; gc.collect(); jax.clear_caches()
+        # Clean up Stage 3
+        del params; del model; gc.collect(); jax.clear_caches()
 
 if __name__ == "__main__":
     main() 

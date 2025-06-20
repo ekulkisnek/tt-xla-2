@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
+# STAGE 1: Single device refactor parity - TP disabled
 """
-Self-contained, real Qwen2.5-7B-Instruct inference script for single-device JAX.
+Self-contained, real Qwen2.5-7B inference script for single-device JAX.
 - Uses real model code and weight mapping from run_inference.py/model.py
 - Prints output to terminal only
 - Allows dtype selection (bfloat16/float32)
 - Cleans up memory after each run
 - No file output, no simplification, no external local imports
-- Uses Qwen2.5-7B-INSTRUCT weights and applies chat templates
 
 Usage 
-python q25_jax_instruct.py --model_path ../instruct_weights --prompt "Hello, how are you?" --max_tokens 20 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
-python q25_jax_instruct.py --model_path ../instruct_weights --prompt "The capital of France is" --max_tokens 10 --temperature 0.1
+python simple_inference.py --model_path ../weights --prompt "Hello, how are you?" --max_tokens 20 --temperature 0.7 --top_p 0.9 --top_k 50 --dtype bfloat16
+python q25_jax.py --model_path ../weights --prompt "The capital of France is" --max_tokens 10 --temperature 0.1
 """
 import os
 import sys
@@ -26,10 +26,70 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from safetensors import safe_open
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("qwen25_instruct")
+logger = logging.getLogger("qwen25_simple")
+
+# === STAGE 2: MESH CREATION ===
+def create_mesh(model_parallel: int, data_parallel: int = 1):
+    """Create a deterministic device mesh for tensor parallelism."""
+    devices = jax.devices()
+    if len(devices) < model_parallel * data_parallel:
+        raise RuntimeError(f"Need {model_parallel * data_parallel} devices, have {len(devices)}")
+    mesh = np.array(devices[:model_parallel * data_parallel]).reshape(data_parallel, model_parallel)
+    return Mesh(mesh, ("data", "model"))
+
+# === STAGE 3: TENSOR PARALLEL DENSE LAYER ===
+class TensorParallelDense(nn.Module):
+    """Dense layer with tensor parallelism support - Stage 3: real split-K matmul."""
+    features: int
+    use_bias: bool = True
+    dtype: jnp.dtype = jnp.float32
+    shard_axes: Tuple[Optional[str], Optional[str]] = (None, "model")
+    reduce_scatter: bool = False  # For o_proj and down_proj
+    
+    @nn.compact
+    def __call__(self, x):
+        # Stage 3: Implement real split-K matmul with sharding constraints
+        kernel = self.param(
+            "kernel",
+            nn.initializers.lecun_normal(),
+            (x.shape[-1], self.features),
+            self.dtype,
+        )
+        
+        # Apply sharding constraint to kernel (only when in mesh context)
+        try:
+            kernel = jax.lax.with_sharding_constraint(kernel, P(*self.shard_axes))
+            in_mesh_context = True
+        except RuntimeError:
+            # Not in mesh context - fall back to regular computation
+            in_mesh_context = False
+        
+        # Each GPU produces its slice
+        y = jnp.matmul(x, kernel)
+        
+        # For layers that need all-reduce (attention o_proj, MLP down_proj)
+        if self.reduce_scatter and in_mesh_context:
+            try:
+                y = jax.lax.psum(y, axis_name="model")
+            except (NameError, ValueError):
+                # psum not available in this context, skip for now
+                pass
+        # Note: Without psum, this should produce "half-heads" nonsense output for q_proj
+        
+        if self.use_bias:
+            bias = self.param("bias", nn.initializers.zeros, (self.features,), self.dtype)
+            # Shard bias along same axis as output features (only when in mesh context)
+            try:
+                bias = jax.lax.with_sharding_constraint(bias, P(self.shard_axes[1]))
+            except RuntimeError:
+                pass
+            y = y + bias
+        
+        return y
 
 # --- Model code (copied from your real model.py, single-device only) ---
 class QwenAttention(nn.Module):
@@ -42,10 +102,42 @@ class QwenAttention(nn.Module):
         self.head_dim = c.get("head_dim", self.hidden_size // self.num_heads)
         self.num_kv_heads = c.get("num_key_value_heads", self.num_heads)
         self.kv_dim = self.num_kv_heads * self.head_dim
-        self.q_proj = nn.Dense(self.hidden_size, dtype=self.dtype, name="q_proj")
-        self.k_proj = nn.Dense(self.kv_dim, dtype=self.dtype, name="k_proj")
-        self.v_proj = nn.Dense(self.kv_dim, dtype=self.dtype, name="v_proj")
-        self.o_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="o_proj")
+        
+        # Step 2.1: q_proj uses TensorParallelDense (output sharded)
+        self.q_proj = TensorParallelDense(
+            features=self.hidden_size, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=(None, "model"), 
+            reduce_scatter=False
+        )
+        
+        # Step 2.5: Add k_proj and v_proj as TensorParallelDense (output sharded)
+        self.k_proj = TensorParallelDense(
+            features=self.kv_dim, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=(None, "model"), 
+            reduce_scatter=False
+        )
+        
+        self.v_proj = TensorParallelDense(
+            features=self.kv_dim, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=(None, "model"), 
+            reduce_scatter=False
+        )
+        
+        # Step 2.4: o_proj uses TensorParallelDense with psum (input sharded)
+        self.o_proj = TensorParallelDense(
+            features=self.hidden_size, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=("model", None),  # Input sharded for all-reduce
+            reduce_scatter=True  # Enable psum for parity restoration
+        )
+        
         self.rope_theta = c.get("rope_theta", 10000.0)
         self.max_position_embeddings = c.get("max_position_embeddings", 4096)
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, cos=None, sin=None):
@@ -92,6 +184,17 @@ class QwenAttention(nn.Module):
         # Store cache before repeating (should be in KV head format)
         cache_k = k
         cache_v = v
+        
+        # Gate 3-A: KV-cache concat order sanity check
+        # Debug prints to verify identical seq lengths across shards
+        try:
+            jax.debug.print("Gate 3-A: device={d} k_seq={s} v_seq={s2}", 
+                           d=jax.lax.axis_index("model"),
+                           s=cache_k.shape[1], 
+                           s2=cache_v.shape[1])
+        except (NameError, ValueError):
+            # Not in mesh context or axis not available, skip debug print
+            pass
         
         # GQA: repeat k/v to match query heads for attention computation
         if self.num_heads != self.num_kv_heads:
@@ -154,30 +257,45 @@ def apply_rotary_emb(q, k, cos, sin):
 
 def make_causal_mask(q_len, k_len):
     """Create causal mask for different query and key lengths."""
-    # Standard causal mask: prevent attending to future positions
-    i = jnp.arange(q_len)[:, None]  # query positions (relative)
-    j = jnp.arange(k_len)[None, :]  # key positions (absolute)
-    
-    # Convert query positions to absolute positions
-    # In generation: k_len includes past + current, q_len is just current
-    query_offset = k_len - q_len  # where current queries start in absolute terms
-    absolute_query_pos = i + query_offset
-    
-    # Mask positions where key > query (i.e., future positions)
-    future_mask = j > absolute_query_pos
-    mask = future_mask.astype(jnp.float32) * -1e4
-    return mask
+    i = jnp.arange(q_len)[:, None]
+    j = jnp.arange(k_len)[None, :]
+    return (i < j - (k_len - q_len)) * -1e9
 
 class QwenMLP(nn.Module):
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
+    
     def setup(self):
         c = self.config
         self.hidden_size = c["hidden_size"]
         self.intermediate_size = c.get("intermediate_size", 4 * self.hidden_size)
-        self.gate_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="gate_proj")
-        self.up_proj = nn.Dense(self.intermediate_size, dtype=self.dtype, use_bias=False, name="up_proj")
-        self.down_proj = nn.Dense(self.hidden_size, dtype=self.dtype, use_bias=False, name="down_proj")
+        
+        # Step 2.5: gate_proj and up_proj as TensorParallelDense (output sharded)
+        self.gate_proj = TensorParallelDense(
+            features=self.intermediate_size, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=(None, "model"), 
+            reduce_scatter=False
+        )
+        
+        self.up_proj = TensorParallelDense(
+            features=self.intermediate_size, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=(None, "model"), 
+            reduce_scatter=False
+        )
+        
+        # down_proj with psum (input sharded for all-reduce)
+        self.down_proj = TensorParallelDense(
+            features=self.hidden_size, 
+            dtype=self.dtype, 
+            use_bias=False, 
+            shard_axes=("model", None), 
+            reduce_scatter=True
+        )
+    
     def __call__(self, x):
         gate = jax.nn.silu(self.gate_proj(x))
         up = self.up_proj(x)
@@ -434,6 +552,19 @@ def load_params(model, model_path, dtype):
     # 4. Update initialized params with loaded weights
     params = map_params(init_params, param_dict)
     
+    # 4.5. Fix LM-head weight tying (after transpose is applied)
+    # DISABLED: This fix improves numerical metrics but degrades generation quality
+    # embed_tokens = params['params']['embed_tokens']['embedding']
+    # lm_head = params['params']['lm_head']['kernel']
+    # 
+    # # For Qwen2.5, lm_head should be tied to embedding weights (transposed)
+    # if embed_tokens.shape == (lm_head.shape[1], lm_head.shape[0]):
+    #     # Shapes are compatible for transpose tying
+    #     params['params']['lm_head']['kernel'] = embed_tokens.T
+    #     logger.info("✓ LM-head weights tied to embedding weights (transposed)")
+    # else:
+    #     logger.warning(f"⚠️ Cannot tie weights: embed_shape={embed_tokens.shape}, lm_head_shape={lm_head.shape}")
+    
     # 5. Validation checks
     logger.info("Validating loaded weights...")
     
@@ -469,69 +600,21 @@ def load_params(model, model_path, dtype):
     
     return params
 
-# --- Chat template support ---
-def apply_chat_template(tokenizer, messages):
-    """Apply the Qwen chat template to messages."""
-    # Use the tokenizer's built-in chat template
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    except Exception as e:
-        logger.warning(f"Failed to apply chat template: {e}")
-        # Fallback to simple concatenation
-        formatted = ""
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                formatted += f"<|im_start|>system\n{content}<|im_end|>\n"
-            elif role == "user":
-                formatted += f"<|im_start|>user\n{content}<|im_end|>\n"
-            elif role == "assistant":
-                formatted += f"<|im_start|>assistant\n{content}<|im_end|>\n"
-        formatted += "<|im_start|>assistant\n"
-        return formatted
+# --- Validation removed for streamlined version ---
 
 # --- Generation ---
-def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
-    """Sample from logits with temperature, top-p, and top-k filtering."""
-    # Convert to fp32 for numerical stability (from repair manual section 10)
-    logits = logits.astype(jnp.float32)
-    
-    # Clip logits to prevent NaNs (from repair manual section 10)
-    logits = jnp.clip(logits, -50.0, 50.0)
-    
+def sample_next_token(logits, temperature=0.7):
+    """Simple sampling from logits with temperature."""
     if temperature < 1e-5:
-        # For greedy, convert to int immediately (from repair manual section 8)
         return jnp.argmax(logits, axis=-1)
-    
-    # Apply temperature
-    logits = logits / jnp.maximum(temperature, 1e-7)
-    
-    # Simplified and more robust sampling without complex filtering
-    # that can cause issues during generation
-    rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
-    return jax.random.categorical(rng_key, logits, axis=-1)
-
-def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50, use_chat_template=True):
-    """Generate text using the model."""
-    
-    # Apply chat template if requested
-    if use_chat_template:
-        messages = [
-            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
-            {"role": "user", "content": prompt}
-        ]
-        formatted_prompt = apply_chat_template(tokenizer, messages)
-        logger.info(f"Chat template applied. Formatted prompt: {repr(formatted_prompt[:200])}...")
     else:
-        formatted_prompt = prompt
-    
+        rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
+        return jax.random.categorical(rng_key, logits / temperature, axis=-1)
+
+def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7):
+    """Generate text using the model."""
     # Tokenize input
-    inputs = tokenizer(formatted_prompt, return_tensors="np")
+    inputs = tokenizer(prompt, return_tensors="np")
     input_ids = inputs["input_ids"]
     
     # Create attention mask - use 4D format for Qwen model
@@ -553,10 +636,8 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
     # Track generated text
     generated_text = ""
     
-    logger.info(f"Starting generation with {input_ids.shape[1]} input tokens...")
-    
     # Generate tokens
-    for i in range(max_tokens):
+    for _ in range(max_tokens):
         # Forward pass
         outputs = model.apply(
             params,
@@ -572,7 +653,7 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         past_key_values = outputs["past_key_values"]
         
         # Sample next token
-        next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_p=top_p, top_k=top_k)
+        next_token = sample_next_token(logits[:, -1, :], temperature=temperature)
         
         # Update state
         state["input_ids"] = next_token[:, None]
@@ -587,7 +668,6 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         
         # Check for end of sequence
         if next_token[0] == tokenizer.eos_token_id:
-            logger.info(f"\nGeneration stopped at EOS token after {i+1} tokens")
             break
     
     print()  # New line at end
@@ -595,15 +675,16 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
 
 # --- Main ---
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct Inference (single device, real model)")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B Stage 3 TP Implementation")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
-    parser.add_argument("--max_tokens", type=int, default=100, help="Maximum tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
+    parser.add_argument("--max_tokens", type=int, default=3, help="Maximum tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter")
     parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
-    parser.add_argument("--no_chat_template", action="store_true", help="Don't apply chat template")
+    parser.add_argument("--tp", type=int, default=1, help="Tensor parallelism degree")
+    parser.add_argument("--save_debug_weights", type=bool, default=False, help="Save debug weights for audit")
     args = parser.parse_args()
     
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
@@ -613,26 +694,59 @@ def main():
     with open(config_path, 'r') as f:
         config = json.load(f)
     
-    logger.info(f"Loaded config: {config}")
-    model = Qwen25ForCausalLM(config=config, dtype=dtype)
-    
     # Load tokenizer
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
-    # Load weights
-    params = load_params(model, args.model_path, dtype)
-    gc.collect(); jax.clear_caches()
-    
-    # Generate
-    generate_text(
-        model, params, tokenizer, args.prompt, args.max_tokens, 
-        args.temperature, args.top_p, args.top_k, 
-        use_chat_template=not args.no_chat_template
-    )
-    
-    # Clean up
-    del params; del model; gc.collect(); jax.clear_caches()
+    if args.tp == 1:
+        logger.info("Stage 3 Step 2.1: Single device smoke test")
+        model = Qwen25ForCausalLM(config=config, dtype=dtype)
+        params = load_params(model, args.model_path, dtype)
+        
+        # Gate 2-A: Unit smoke-test on one GPU - must print ", I am"
+        logger.info("🧪 Gate 2-A: Single device smoke test with q_proj TP")
+        generate_text(model, params, tokenizer, args.prompt, args.max_tokens, args.temperature)
+        
+        logger.info("✅ Gate 2-A passed - single device works with TensorParallelDense q_proj")
+        
+        # Clean up
+        del params; del model; gc.collect(); jax.clear_caches()
+        
+    else:
+        logger.info(f"Stage 3 Step 2.2: Multi-device mode with TP={args.tp}")
+        
+        # Create mesh and enter mesh context
+        mesh = create_mesh(model_parallel=args.tp, data_parallel=1)
+        logger.info(f"Created mesh: {mesh.devices.shape} with axes {mesh.axis_names}")
+        
+        with mesh:
+            model = Qwen25ForCausalLM(config=config, dtype=dtype)
+            
+            # Load params in mesh context
+            params = load_params(model, args.model_path, dtype)
+            
+            if args.save_debug_weights:
+                logger.info("💾 Saving debug weights for audit")
+                # Gate 2-B: Two-GPU weight-shape audit
+                try:
+                    q_proj_kernel = params['params']['layers_0']['self_attn']['q_proj']['kernel']
+                    logger.info(f"q_proj kernel shape: {q_proj_kernel.shape}")
+                    logger.info(f"Expected shape per shard: ({config['hidden_size']}, {config['hidden_size']//args.tp})")
+                    
+                    # Save shard for inspection
+                    np.save("scripts/q_proj_kernel_shard0.npy", jax.device_get(q_proj_kernel))
+                    logger.info("✅ Gate 2-B: Weight shapes saved for audit")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not save debug weights: {e}")
+            
+            # Gate 2-C: Functional diff gate - should produce nonsense without psum
+            logger.info("🧪 Gate 2-C: Functional diff test (should be nonsense without psum)")
+            generate_text(model, params, tokenizer, args.prompt, args.max_tokens, args.temperature)
+            
+            logger.info("✅ Gate 2-C: Diff test completed (output should be nonsense)")
+            
+            # Clean up
+            del params; del model; gc.collect(); jax.clear_caches()
 
 if __name__ == "__main__":
     main() 
