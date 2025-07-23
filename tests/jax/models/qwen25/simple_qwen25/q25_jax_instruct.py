@@ -486,15 +486,22 @@ def apply_chat_template(tokenizer, messages):
         return formatted
 
 # --- Generation ---
-def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
-    """Sample from logits with temperature, top-p, and top-k filtering."""
+def sample_next_token(logits, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, past_tokens=None):
+    """Sample from logits with official Qwen2.5-7B-Instruct parameters."""
     if temperature < 1e-5:
         return jnp.argmax(logits, axis=-1)
+    
+    # Apply repetition penalty if we have past tokens
+    if repetition_penalty != 1.0 and past_tokens is not None and len(past_tokens) > 0:
+        # Apply penalty to previously generated tokens
+        for token_id in past_tokens[-50:]:  # Only consider last 50 tokens
+            if 0 <= token_id < logits.shape[-1]:
+                logits = logits.at[..., token_id].multiply(1.0 / repetition_penalty)
     
     # Apply temperature
     logits = logits / temperature
     
-    # Top-k filtering
+    # Top-k filtering (official: k=20)
     if top_k > 0:
         # Handle batch dimension properly
         batch_size = logits.shape[0]
@@ -511,7 +518,7 @@ def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
         # Set non-top-k logits to -inf
         logits = jnp.where(mask, logits, -jnp.inf)
     
-    # Top-p (nucleus) filtering
+    # Top-p (nucleus) filtering (official: p=0.8)
     if top_p < 1.0:
         # Sort logits in descending order
         sorted_indices = jnp.argsort(logits, axis=-1)[..., ::-1]
@@ -535,8 +542,8 @@ def sample_next_token(logits, temperature=0.7, top_p=0.9, top_k=50):
     rng_key = jax.random.PRNGKey(int(time.time() * 1000) % 2**32)
     return jax.random.categorical(rng_key, logits, axis=-1)
 
-def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.9, top_k=50, use_chat_template=True):
-    """Generate text using the model."""
+def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7, top_p=0.8, top_k=20, repetition_penalty=1.05, use_chat_template=True):
+    """Generate text using the model with official parameters."""
     
     # Apply chat template if requested
     if use_chat_template:
@@ -569,10 +576,12 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         "past_key_values": None,
     }
     
-    # Track generated text
+    # Track generated text and tokens for repetition penalty
     generated_text = ""
+    generated_tokens = []
     
     logger.info(f"Starting generation with {input_ids.shape[1]} input tokens...")
+    logger.info(f"Using official parameters: temperature={temperature}, top_p={top_p}, top_k={top_k}, repetition_penalty={repetition_penalty}")
     
     # Generate tokens
     for i in range(max_tokens):
@@ -590,8 +599,18 @@ def generate_text(model, params, tokenizer, prompt, max_tokens, temperature=0.7,
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         
-        # Sample next token
-        next_token = sample_next_token(logits[:, -1, :], temperature=temperature, top_p=top_p, top_k=top_k)
+        # Sample next token with repetition penalty
+        next_token = sample_next_token(
+            logits[:, -1, :], 
+            temperature=temperature, 
+            top_p=top_p, 
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            past_tokens=generated_tokens
+        )
+        
+        # Track generated token for repetition penalty
+        generated_tokens.append(int(next_token[0]))
         
         # Update state
         state["input_ids"] = next_token[:, None]
@@ -618,9 +637,10 @@ def main():
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--prompt", type=str, required=True, help="Input prompt")
     parser.add_argument("--max_tokens", type=int, default=100, help="Maximum tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
-    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling parameter")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling parameter")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (official: 0.7)")
+    parser.add_argument("--top_p", type=float, default=0.8, help="Top-p sampling parameter (official: 0.8)")
+    parser.add_argument("--top_k", type=int, default=20, help="Top-k sampling parameter (official: 20)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.05, help="Repetition penalty (official: 1.05)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--no_chat_template", action="store_true", help="Don't apply chat template")
     args = parser.parse_args()
@@ -643,10 +663,10 @@ def main():
     params = load_params(model, args.model_path, dtype)
     gc.collect(); jax.clear_caches()
     
-    # Generate
+    # Generate with official parameters
     generate_text(
         model, params, tokenizer, args.prompt, args.max_tokens, 
-        args.temperature, args.top_p, args.top_k, 
+        args.temperature, args.top_p, args.top_k, args.repetition_penalty,
         use_chat_template=not args.no_chat_template
     )
     
