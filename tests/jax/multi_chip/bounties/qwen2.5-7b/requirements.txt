@@ -1,0 +1,33 @@
+# JAX Qwen2.5-7B Tensor Parallel Implementation Requirements
+# Following patterns from accepted bounty submissions
+
+# Core JAX/ML packages
+jax>=0.4.20
+flax>=0.8.0
+jaxtyping>=0.2.21
+numpy>=1.24.0
+transformers>=4.36.0
+safetensors>=0.4.0
+orbax-checkpoint>=0.4.0
+
+# For tokenization and model loading
+tokenizers>=0.15.0
+huggingface-hub>=0.19.0
+
+# For evaluation
+datasets>=2.15.0
+
+# For testing and development
+pytest>=7.4.0
+
+# Optional dependencies for extended functionality
+# torch  # For HuggingFace PyTorch model comparison
+# matplotlib  # For plotting performance metrics
+# psutil  # For memory monitoring
+
+# Specific versions for reproducibility
+# These versions are known to work well together
+jax==0.4.23
+flax==0.8.0
+transformers==4.36.2
+safetensors==0.4.1 
