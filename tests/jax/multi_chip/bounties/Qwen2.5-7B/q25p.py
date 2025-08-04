@@ -370,7 +370,7 @@ def transpose_if_needed(name, param):
 
 def load_params(model, model_path, dtype):
     """Load model parameters from safetensors files."""
-    print(f"[Progress] Loading JAX model weights from {model_path}...")
+    print(f"Loading JAX model weights from {model_path}...")
     params = {"params": {}}
     loaded_count = 0
     for file in os.listdir(model_path):
@@ -387,10 +387,8 @@ def load_params(model, model_path, dtype):
                             d = d.setdefault(p, {})
                         d[path[-1]] = param
                         loaded_count += 1
-                        if loaded_count <= 10:
-                            print(f"[Progress] Loaded: {key} -> {path}")
     gc.collect()
-    print(f"[Progress] Weight loading completed. Loaded {loaded_count} parameters.")
+    print(f"Weight loading completed. Loaded {loaded_count} parameters.")
     return params
 
 # --- Generation ---
@@ -399,13 +397,13 @@ def sample_next_token(logits):
     return int(jnp.argmax(logits, axis=-1)[0])
 
 def generate_text(model, params, tokenizer, max_tokens, prompt):
-    print("[Progress] Starting text generation...")
+    print("Starting text generation...")
     
     # Monitor memory usage
     process = psutil.Process()
     initial_memory = process.memory_info().rss / 1024**3
-    print(f"[Progress] Initial memory before generation: {initial_memory:.2f} GB used")
-    print(f"[Progress] Free memory: {psutil.virtual_memory().available / 1024**3:.2f} GB")
+    print(f"Initial memory before generation: {initial_memory:.2f} GB used")
+    print(f"Free memory: {psutil.virtual_memory().available / 1024**3:.2f} GB")
     
     # Tokenize input
     input_ids = tokenizer.encode(prompt, return_tensors="jax")
@@ -421,9 +419,11 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
     # The ParallelDense layers handle tensor parallelism internally
 
     num_tokens_generated = 0
-    print(f"[Progress] Entering generation loop for {max_tokens} tokens...")
+    print(f"Entering generation loop for {max_tokens} tokens...")
+    print("Generating tokens (this may take a while on CPU)...")
+    
     for i in range(max_tokens):
-        print(f"[Progress] Generating token {i+1}/{max_tokens}...")
+        print(f"Generating token {i+1}/{max_tokens}...", end="", flush=True)
         # Create attention mask with proper shape for current sequence
         current_seq_len = input_ids.shape[1]
         key_len = current_seq_len if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + current_seq_len
@@ -446,24 +446,26 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
         if current_mem > peak_memory:
             peak_memory = current_mem
         
-        token = tokenizer.decode(int(next_token), skip_special_tokens=True)
-        print(f"[Progress] Gen token {i+1}/{max_tokens}: {token}")
-        if int(next_token) == tokenizer.eos_token_id or "<|im_end|>" in token:
-            print("[Progress] Stopping generation: EOS token encountered.")
+        # Show the generated token
+        token_text = tokenizer.decode(int(next_token), skip_special_tokens=True)
+        print(f" -> '{token_text}'")
+        
+        if int(next_token) == tokenizer.eos_token_id or "<|im_end|>" in token_text:
+            print("Stopping generation: EOS token encountered.")
             break
     
     end_time = time.time()
     total_time = end_time - start_time
     avg_time_per_token = total_time / num_tokens_generated if num_tokens_generated > 0 else 0
     
-    print(f"[Progress] Memory after generation: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
-    print(f"[Progress] Peak memory during generation: {peak_memory:.2f} GB used")
-    print(f"[Progress] Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
-    print(f"[Progress] Total tokens generated: {num_tokens_generated}")
-    print(f"[Progress] Average time per token: {avg_time_per_token:.2f} seconds")
+    print(f"Memory after generation: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+    print(f"Peak memory during generation: {peak_memory:.2f} GB used")
+    print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+    print(f"Total tokens generated: {num_tokens_generated}")
+    print(f"Average time per token: {avg_time_per_token:.2f} seconds")
     
     full_output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    print("[Progress] Generation complete.")
+    print("Generation complete.")
     return full_output, peak_memory, avg_time_per_token
 
 
@@ -471,19 +473,19 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
 def setup_device_mesh():
     """Setup device mesh for tensor parallelism."""
     global mesh
-    print("[Progress] Setting up device mesh...")
+    print("Setting up device mesh...")
     devices = jax.devices()
-    print(f"[Progress] Available devices: {len(devices)}")
+    print(f"Available devices: {len(devices)}")
     for i, device in enumerate(devices):
         print(f"  Device {i}: {device}")
     
     if len(devices) == 1:
-        print("[Progress] Single device detected - using single device mode")
+        print("Single device detected - using single device mode")
         mesh = Mesh(devices, axis_names=("mp",))
     else:
         # Use all available devices for tensor parallelism
         mesh = Mesh(devices, axis_names=("mp",))
-        print(f"[Progress] Created multi-device mesh: {mesh}")
+        print(f"Created multi-device mesh: {mesh}")
     
     return mesh
 
@@ -506,15 +508,13 @@ def main():
     params = load_params(model, args.model_path, dtype)
     
     # Test with dog food math problem
-    print("\n=== DOG FOOD MATH TEST ===")
     dog_food_prompt = "Janet's dogs eat 2 pounds of dog food each day. If Janet buys a 50-pound bag, how many days will it last?"
-    print(f"Testing with: {dog_food_prompt}")
+    print(f"Prompt: {dog_food_prompt}")
     # Generate more tokens for a more complex response
     output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 30, dog_food_prompt)
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
     print(f"Avg time per token: {avg_time_per_token:.4f} seconds")
-    print("=== DOG FOOD MATH TEST COMPLETE ===")
 
 if __name__ == "__main__":
     main() 
