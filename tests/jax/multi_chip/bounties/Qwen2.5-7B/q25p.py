@@ -197,7 +197,7 @@ class ParallelEmbed(nn.Module):
         return embedding[inputs.astype("i4")]
 
 class ParallelDense(nn.Module):
-    """Full parallel dense layer with tensor parallelism."""
+    """Optimized parallel dense layer with tensor parallelism."""
     features: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -210,7 +210,7 @@ class ParallelDense(nn.Module):
         in_dim = x.shape[-1]
         out_dim = self.features
         
-        # Load parameters - they are now pre-sharded
+        # Load parameters - shard_map will handle the sharding automatically
         kernel = self.param(
             "kernel", nn.initializers.lecun_normal(), (in_dim, out_dim), self.param_dtype
         )
@@ -221,17 +221,11 @@ class ParallelDense(nn.Module):
             bias = None
 
         def matmul_fn(x, k, b=None):
-            # For now, handle both sharded and non-sharded parameters
-            # If kernel is sharded (has 3 dimensions), use the device's shard
-            if k.ndim == 3:  # [num_devices, in_dim, shard_size]
-                device_idx = jax.lax.axis_index("mp")
-                k = k[device_idx]  # Get this device's shard
-                if b is not None and b.ndim == 2:  # [num_devices, shard_size]
-                    b = b[device_idx]
-            
+            # k is automatically sharded by shard_map input specs
+            # Each device gets its shard of the kernel
             local_out = jnp.einsum("bsd,df->bsf", x, k)
             
-            # Apply bias if provided
+            # Apply bias if provided (bias is also sharded)
             if b is not None:
                 local_out = local_out + b
             
@@ -395,17 +389,9 @@ def load_params(model, model_path, dtype):
                         param = jnp.array(param, dtype=jnp.bfloat16) # Always load as bfloat16
                         param = transpose_if_needed(key, param)
                         
-                        # Shard parameters that should be sharded (dense layers, attention projections)
-                        if should_shard_parameter(key):
-                            # Shard along the output dimension for matrix multiplications
-                            if param.ndim == 2:  # [in_dim, out_dim]
-                                shard_size = param.shape[1] // num_devices
-                                # Ensure even sharding
-                                if param.shape[1] % num_devices == 0:
-                                    param = param.reshape(param.shape[0], num_devices, shard_size)
-                                    param = param.transpose(1, 0, 2)  # [num_devices, in_dim, shard_size]
-                                else:
-                                    print(f"Warning: Cannot evenly shard {key} with shape {param.shape} across {num_devices} devices")
+                        # For tensor parallelism, we don't pre-shard parameters
+                        # shard_map will handle the sharding automatically based on input specs
+                        # Just store the full parameters and let JAX handle the distribution
                         
                         d = params["params"]
                         for p in path[:-1]:
@@ -416,15 +402,7 @@ def load_params(model, model_path, dtype):
     print(f"Weight loading completed. Loaded {loaded_count} parameters.")
     return params
 
-def should_shard_parameter(param_name):
-    """Determine if a parameter should be sharded for tensor parallelism."""
-    # Shard dense layer weights and attention projections
-    shardable_patterns = [
-        "q_proj.kernel", "k_proj.kernel", "v_proj.kernel", "o_proj.kernel",
-        "gate_proj.kernel", "up_proj.kernel", "down_proj.kernel",
-        "lm_head.kernel"
-    ]
-    return any(pattern in param_name for pattern in shardable_patterns)
+
 
 # --- Generation ---
 def sample_next_token(logits):
