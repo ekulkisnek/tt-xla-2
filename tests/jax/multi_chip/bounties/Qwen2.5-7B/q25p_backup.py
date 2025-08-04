@@ -35,7 +35,7 @@ from typing import Dict, Any, Optional, Tuple
 os.environ["JAX_ENABLE_X64"] = "0"
 
 # Set up multi-device (do this before importing jax)
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
 
 import jax
 import jax.numpy as jnp
@@ -210,7 +210,7 @@ class ParallelDense(nn.Module):
         in_dim = x.shape[-1]
         out_dim = self.features
         
-        # Load parameters - they are now pre-sharded
+        # Load full-size parameters (compatible with weight loading)
         kernel = self.param(
             "kernel", nn.initializers.lecun_normal(), (in_dim, out_dim), self.param_dtype
         )
@@ -221,24 +221,17 @@ class ParallelDense(nn.Module):
             bias = None
 
         def matmul_fn(x, k, b=None):
-            # For now, handle both sharded and non-sharded parameters
-            # If kernel is sharded (has 3 dimensions), use the device's shard
-            if k.ndim == 3:  # [num_devices, in_dim, shard_size]
-                device_idx = jax.lax.axis_index("mp")
-                k = k[device_idx]  # Get this device's shard
-                if b is not None and b.ndim == 2:  # [num_devices, shard_size]
-                    b = b[device_idx]
-            
+            # Kernel is already sharded by input spec P(None, "mp")
+            # k is already the shard for this device
             local_out = jnp.einsum("bsd,df->bsf", x, k)
             
-            # Apply bias if provided
+            # Apply bias if provided (bias is also sharded by input spec)
             if b is not None:
                 local_out = local_out + b
             
-            # Gather results from all devices
             full_out = jax.lax.all_gather(local_out, axis_name="mp", axis=0)
             
-            # Reshape to combine all device outputs
+            # Reshape to combine all device outputs - use transpose like Llama
             result = jnp.reshape(
                 jnp.transpose(full_out, (1, 2, 0, 3)), (x.shape[0], x.shape[1], -1)
             )
@@ -376,15 +369,10 @@ def transpose_if_needed(name, param):
     return param
 
 def load_params(model, model_path, dtype):
-    """Load model parameters from safetensors files with proper sharding."""
+    """Load model parameters from safetensors files."""
     print(f"Loading JAX model weights from {model_path}...")
     params = {"params": {}}
     loaded_count = 0
-    
-    # Get number of devices for sharding
-    num_devices = len(jax.devices())
-    print(f"Sharding parameters across {num_devices} devices")
-    
     for file in os.listdir(model_path):
         if file.endswith(".safetensors"):
             with safe_open(os.path.join(model_path, file), framework="numpy") as f:
@@ -394,19 +382,6 @@ def load_params(model, model_path, dtype):
                         param = f.get_tensor(key)
                         param = jnp.array(param, dtype=jnp.bfloat16) # Always load as bfloat16
                         param = transpose_if_needed(key, param)
-                        
-                        # Shard parameters that should be sharded (dense layers, attention projections)
-                        if should_shard_parameter(key):
-                            # Shard along the output dimension for matrix multiplications
-                            if param.ndim == 2:  # [in_dim, out_dim]
-                                shard_size = param.shape[1] // num_devices
-                                # Ensure even sharding
-                                if param.shape[1] % num_devices == 0:
-                                    param = param.reshape(param.shape[0], num_devices, shard_size)
-                                    param = param.transpose(1, 0, 2)  # [num_devices, in_dim, shard_size]
-                                else:
-                                    print(f"Warning: Cannot evenly shard {key} with shape {param.shape} across {num_devices} devices")
-                        
                         d = params["params"]
                         for p in path[:-1]:
                             d = d.setdefault(p, {})
@@ -415,16 +390,6 @@ def load_params(model, model_path, dtype):
     gc.collect()
     print(f"Weight loading completed. Loaded {loaded_count} parameters.")
     return params
-
-def should_shard_parameter(param_name):
-    """Determine if a parameter should be sharded for tensor parallelism."""
-    # Shard dense layer weights and attention projections
-    shardable_patterns = [
-        "q_proj.kernel", "k_proj.kernel", "v_proj.kernel", "o_proj.kernel",
-        "gate_proj.kernel", "up_proj.kernel", "down_proj.kernel",
-        "lm_head.kernel"
-    ]
-    return any(pattern in param_name for pattern in shardable_patterns)
 
 # --- Generation ---
 def sample_next_token(logits):
