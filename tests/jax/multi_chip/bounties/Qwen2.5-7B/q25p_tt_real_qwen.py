@@ -137,7 +137,7 @@ def main():
     
     try:
         # Generate with real model
-        generated_answer = generate_with_real_model(model, tokenizer, janet_prompt, max_tokens=50)
+        generated_answer = generate_with_real_model(model, tokenizer, janet_prompt, max_tokens=200)
         
         # Show mathematical expectation
         print("\n🧮 Mathematical calculation:")
