@@ -34,10 +34,16 @@ Design rationale:
 ## Usage
 - **Inference Demo**: Run generation on multi-device.
   ```
-  python generate_multi_chip.py --model_path /path/to/weights
+  python generate_multi_chip.py --model_path /path/to/weights --prompt "Your custom prompt here"
   ```
-  - Outputs response to sample prompt (Sam's test scores), with memory/timing stats.
-  - Simulate meshes: Set `os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=N'` (e.g., N=8 for 1x8).
+  - Outputs response to your custom prompt, with memory/timing stats.
+  - **Command line options:**
+    - `--model_path`: Path to model weights (required)
+    - `--prompt`: Custom prompt to generate text for (default: Sam's test scores question)
+    - `--max_tokens`: Maximum number of tokens to generate (default: 500)
+    - `--dtype`: Choose "bfloat16" (default) or "float32"
+    - `--no_realtime`: Disable real-time token display
+  - **Simulate meshes**: Set `os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=N'` (e.g., N=8 for 1x8).
 
 - **GSM8K Evaluation**: Verify accuracy and single- vs TP-equivalence.
   ```
@@ -53,10 +59,15 @@ Design rationale:
 - **Optimization**: bfloat16, no x64 for speed; memory monitoring via psutil.
 
 ## Sample Inputs/Outputs
-Example from generate_multi_chip.py (Sam's prompt):
+Example from generate_multi_chip.py (default prompt):
 - Input: "Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
 - Output: [Generated reasoning and boxed answer, e.g., \boxed{85}].
 - Stats: Peak memory ~X GB, avg time per token ~Y seconds on simulated 1x8.
+
+**Custom prompt example:**
+```bash
+python generate_multi_chip.py --model_path /path/to/weights --prompt "Explain quantum computing in simple terms" --max_tokens 200
+```
 
 GSM8K sample (from test_gsm8k.py):
 - Question: [Dataset example]
@@ -67,6 +78,26 @@ GSM8K sample (from test_gsm8k.py):
 Tested on simulated 1x8 (default). For others (e.g., 2x4):
 - Set device count to total (e.g., 8).
 - Modify mesh to 2D if needed: `Mesh(np.reshape(devices, (2,4)), ('row', 'col'))`; update in_specs/out_specs.
+
+## Device Simulation
+To simulate different numbers of devices for tensor parallelism:
+
+**Before running the script, set the environment variable:**
+```bash
+# Simulate 8 devices (1x8 mesh)
+export XLA_FLAGS="--xla_force_host_platform_device_count=8"
+python generate_multi_chip.py --model_path /path/to/weights --prompt "Your prompt"
+
+# Simulate 4 devices (1x4 mesh)  
+export XLA_FLAGS="--xla_force_host_platform_device_count=4"
+python generate_multi_chip.py --model_path /path/to/weights --prompt "Your prompt"
+
+# Simulate 2 devices (1x2 mesh)
+export XLA_FLAGS="--xla_force_host_platform_device_count=2"
+python generate_multi_chip.py --model_path /path/to/weights --prompt "Your prompt"
+```
+
+The script will automatically detect the available devices and create the appropriate mesh for tensor parallelism.
 
 ## Known Limitations
 - KV cache concatenation may grow memory; future: in-place updates.

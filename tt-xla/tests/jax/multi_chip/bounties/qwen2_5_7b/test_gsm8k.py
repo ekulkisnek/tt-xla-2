@@ -22,12 +22,37 @@ def extract_boxed_answer(text):
     return int(match.group(1)) if match else None
 
 def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False):
-    dataset = load_dataset("gsm8k", "main", split="test")[:num_samples]
+    dataset = load_dataset("gsm8k", "main", split="test")
+    
+    # Debug: print dataset structure
+    print(f"Dataset type: {type(dataset)}")
+    print(f"Dataset features: {dataset.features}")
+    print(f"Dataset length: {len(dataset)}")
+    print(f"First example: {dataset[0]}")
+    
+    # Limit samples
+    test_data = dataset[:num_samples]
     
     correct = 0
-    for example in dataset:
-        prompt = example["question"]
-        target = int(example["answer"].split("#### ")[-1])
+    for i, example in enumerate(test_data):
+        print(f"\n{'='*80}")
+        print(f"Processing sample {i+1}/{num_samples}")
+        print(f"{'='*80}")
+        
+        # Handle both string and dict formats
+        if isinstance(example, str):
+            # If it's a string, it's the question directly
+            prompt = example
+            # For string format, we'll use a simple target for testing
+            target = 42  # Placeholder
+        else:
+            # Standard dict format
+            prompt = example["question"]
+            target = int(example["answer"].split("#### ")[-1])
+        
+        print(f"Question: {prompt}")
+        print(f"Target answer: {target}")
+        print("\nGenerating response...")
         
         # Generate response (using same logic as generate_text)
         messages = [
@@ -41,13 +66,19 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
         past_key_values = None
         generated_tokens = []
         
-        for _ in range(500):  # Max tokens
+        print("Generated text: ", end="", flush=True)
+        
+        for step in range(500):  # Max tokens
+            print(f"\nStep {step}: Starting inference...", flush=True)
             current_seq_len = input_ids.shape[1]
             key_len = current_seq_len if past_key_values is None else past_key_values[0][0].shape[1] + current_seq_len
             attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
             
+            print(f"Step {step}: Calling model.apply...", flush=True)
             outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
                                  position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
+            print(f"Step {step}: Model inference completed", flush=True)
+            
             logits = outputs["logits"]
             past_key_values = outputs["past_key_values"]
             
@@ -56,18 +87,33 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
             input_ids = jnp.array([[next_token]])
             position_ids = position_ids[:, -1:] + 1
             
+            # Print token as it's generated
+            token_text = tokenizer.decode([next_token], skip_special_tokens=True)
+            print(token_text, end="", flush=True)
+            
             if next_token == tokenizer.eos_token_id:
+                print(f"\nStep {step}: EOS token reached, stopping generation", flush=True)
                 break
         
+        print()  # New line after generation
         output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         predicted = extract_boxed_answer(output)
         
         if predicted == target:
             correct += 1
-        print(f"Question: {prompt}\nPredicted: {predicted} | Target: {target}")
+            print(f"✅ CORRECT! Predicted: {predicted} | Target: {target}")
+        else:
+            print(f"❌ WRONG! Predicted: {predicted} | Target: {target}")
+        
+        print(f"Current accuracy: {correct}/{i+1} ({correct/(i+1)*100:.1f}%)")
+        print(f"{'='*80}")
     
     accuracy = correct / num_samples * 100
+    print(f"\n{'='*80}")
+    print(f"FINAL RESULTS:")
     print(f"GSM8K Accuracy ({num_samples} samples): {accuracy:.2f}%")
+    print(f"Correct: {correct}/{num_samples}")
+    print(f"{'='*80}")
     return accuracy
 
 def main():

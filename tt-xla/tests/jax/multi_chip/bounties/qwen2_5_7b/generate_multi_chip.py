@@ -20,7 +20,7 @@ from model import Qwen25ForCausalLM, setup_device_mesh, load_params, sample_next
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("qwen25_generate_multi_chip")
 
-def generate_text(model, params, tokenizer, max_tokens, prompt):
+def generate_text(model, params, tokenizer, max_tokens, prompt, show_realtime=True):
     print("Starting text generation...")
     
     # Monitor memory usage
@@ -28,6 +28,11 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
     initial_memory = process.memory_info().rss / 1024**3
     print(f"Initial memory before generation: {initial_memory:.2f} GB used")
     print(f"Free memory: {psutil.virtual_memory().available / 1024**3:.2f} GB")
+    
+    if show_realtime:
+        print("\n=== REAL-TIME GENERATION ===")
+        print("(Text will appear as it's generated)")
+        print("=" * 50)
     
     # Tokenize input with chat template
     messages = [
@@ -95,9 +100,12 @@ def generate_text(model, params, tokenizer, max_tokens, prompt):
     return full_output, peak_memory, avg_time_per_token
 
 def main():
-    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference for Sam's Test Scores Question")
+    parser = argparse.ArgumentParser(description="Qwen2.5-7B-Instruct JAX Inference with Custom Prompts")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model weights")
+    parser.add_argument("--prompt", type=str, default="Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?", help="Custom prompt to generate text for")
+    parser.add_argument("--max_tokens", type=int, default=500, help="Maximum number of tokens to generate")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument("--no_realtime", action="store_true", help="Disable real-time text display")
     args = parser.parse_args()
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
@@ -112,14 +120,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    # Only run Sam's test scores question as sample
-    sam_question = "Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
-    
     print(f"\n{'='*80}")
-    print("Sam's Test Scores Question:")
-    print(f"Prompt: {sam_question}")
-    # Generate with 500 max tokens for thorough reasoning
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, 500, sam_question)
+    print("Custom Prompt Generation:")
+    print(f"Prompt: {args.prompt}")
+    # Generate with specified max tokens
+    show_realtime = not args.no_realtime
+    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, args.max_tokens, args.prompt, show_realtime)
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
     print(f"Avg time per token: {avg_time_per_token:.4f} seconds")

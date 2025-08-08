@@ -12,82 +12,34 @@ import numpy as np
 from safetensors import safe_open
 import os
 import gc
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
 
-# Global mesh (set externally in generation scripts)
+# Global mesh (set externally, e.g., in generate scripts)
 mesh = None
 
 def setup_device_mesh():
-    """Set up device mesh for tensor parallelism."""
+    """Setup device mesh for tensor parallelism."""
     global mesh
-    devices = jax.devices()
-    mesh = jax.sharding.Mesh(devices, ("mp",))
+    from jax.sharding import Mesh
+    devices = np.array(jax.devices())
+    print(f"Available devices: {len(devices)}")
+    # Create 1D mesh for tensor parallelism
+    mesh = Mesh(devices, ("mp",))
+    print(f"Created mesh: {mesh}")
+    return mesh
 
-def make_causal_mask(seq_len: int, key_len: int = None) -> jnp.ndarray:
-    """Create causal attention mask."""
-    if key_len is None:
-        key_len = seq_len
-    return jnp.tril(jnp.ones((seq_len, key_len))) - 1
-
-def sample_next_token(logits: jnp.ndarray, temperature: float = 0.0) -> jnp.ndarray:
-    """Sample next token from logits (greedy if temperature=0)."""
+def sample_next_token(logits, temperature=0.0):
+    """Sample next token from logits using greedy sampling."""
     if temperature == 0.0:
-        return jnp.argmax(logits, axis=-1)[0]  # Extract scalar from batch
+        return jnp.argmax(logits, axis=-1).item()
     else:
         scaled_logits = logits / temperature
         probs = jax.nn.softmax(scaled_logits, axis=-1)
-        return jax.random.categorical(jax.random.PRNGKey(42), probs)[0]  # Extract scalar from batch
-
-# --- Precomputed RoPE ---
-def precompute_freqs_cis(dim: int, end: int, theta: float = 1000000.0):
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype(jnp.float32) / dim))
-    t = jnp.arange(end, dtype=jnp.float32)
-    freqs = jnp.outer(t, freqs).astype(jnp.float32)
-    return jnp.exp(1j * freqs)  # Complex for efficient application
-
-def apply_rotary_emb_complex(q, k, freqs_cis):
-    half_dim = q.shape[-1] // 2
-    
-    q1, q2 = q[..., :half_dim], q[..., half_dim:]
-    k1, k2 = k[..., :half_dim], k[..., half_dim:]
-    
-    q_complex = jax.lax.complex(q1.astype(jnp.float32), q2.astype(jnp.float32))
-    k_complex = jax.lax.complex(k1.astype(jnp.float32), k2.astype(jnp.float32))
-    
-    freqs_cis_expanded = freqs_cis[..., None, :]
-    q_rot = q_complex * freqs_cis_expanded
-    k_rot = k_complex * freqs_cis_expanded
-    
-    q_rot_real = jnp.concatenate([jnp.real(q_rot), jnp.imag(q_rot)], axis=-1)
-    k_rot_real = jnp.concatenate([jnp.real(k_rot), jnp.imag(k_rot)], axis=-1)
-    
-    return q_rot_real, k_rot_real
+        return jax.random.categorical(jax.random.PRNGKey(0), scaled_logits, axis=-1).item()
 
 # --- Model Code ---
-class FlaxQwenPreTrainedModel(nn.Module):
-    """Base class for Qwen pretrained models with standard initialization."""
-    
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: Dict = None) -> Dict:
-        init_rngs = {"params": rng}
-        if params is None:
-            params = self.init(init_rngs, jnp.ones(input_shape), return_dict=True)["params"]
-        return params
-    
-    def init_cache(self, batch_size: int, max_length: int) -> Dict:
-        cache = {}
-        num_kv_heads = self.config.get("num_key_value_heads", self.config["num_attention_heads"])
-        head_dim = self.config["hidden_size"] // self.config["num_attention_heads"]
-        for layer_idx in range(self.config["num_hidden_layers"]):
-            cache[f"layers_{layer_idx}"] = {
-                "self_attn": {
-                    "cached_key": jnp.zeros((batch_size, max_length, num_kv_heads, head_dim), dtype=jnp.bfloat16),
-                    "cached_value": jnp.zeros((batch_size, max_length, num_kv_heads, head_dim), dtype=jnp.bfloat16),
-                    "cache_index": jnp.array(0, dtype=jnp.int32)
-                }
-            }
-        return cache
-
 class FullyParallelQwenAttention(nn.Module):
+    """Full parallel attention with all projections using ParallelDense."""
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
@@ -99,8 +51,8 @@ class FullyParallelQwenAttention(nn.Module):
         self.num_kv_heads = c.get("num_key_value_heads", self.num_heads)
         self.kv_dim = self.num_kv_heads * self.head_dim
         self.rope_theta = c.get("rope_theta", 1000000.0)
-        self.max_seq_len = c.get("max_position_embeddings", 2048)
         
+        # All projections use ParallelDense for full tensor parallelism
         self.q_proj = ParallelDense(
             self.hidden_size, 
             dtype=jnp.bfloat16, 
@@ -129,68 +81,84 @@ class FullyParallelQwenAttention(nn.Module):
             use_bias=False,
             name="o_proj"
         )
-        
-        self.freqs_cis = precompute_freqs_cis(self.head_dim, c["max_position_embeddings"], self.rope_theta)
 
     def __call__(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None):
         batch, seq, _ = hidden_states.shape
 
+        # Project inputs using FULL PARALLEL approach
         q = self.q_proj(hidden_states).reshape(batch, seq, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
         v = self.v_proj(hidden_states).reshape(batch, seq, self.num_kv_heads, self.head_dim)
 
+        # Apply rotary embeddings
         if position_ids is not None:
-            if position_ids.shape[1] != seq:
-                if past_key_value is not None:
-                    start_pos = past_key_value[0].shape[1]
-                    position_ids = jnp.arange(start_pos, start_pos + seq, dtype=jnp.int32)[None, :]
-                else:
-                    position_ids = jnp.arange(seq, dtype=jnp.int32)[None, :]
-            
-            position_ids = jnp.clip(position_ids, 0, len(self.freqs_cis) - 1)
-            freqs_cis = self.freqs_cis[position_ids]
-            q, k = apply_rotary_emb_complex(q, k, freqs_cis)
+            cos, sin = compute_cos_sin_cache(position_ids, self.head_dim, self.rope_theta)
+            q, k = apply_rotary_emb(q, k, cos, sin)
 
+        # Handle KV cache
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            if self.num_heads != self.num_kv_heads:
-                repeat = self.num_heads // self.num_kv_heads
-                k = jnp.repeat(k, repeat, axis=2)
-                v = jnp.repeat(v, repeat, axis=2)
-            k_full = jnp.concatenate([past_k, k], axis=1)
-            v_full = jnp.concatenate([past_v, v], axis=1)
-        else:
-            if self.num_heads != self.num_kv_heads:
-                repeat = self.num_heads // self.num_kv_heads
-                k_full = jnp.repeat(k, repeat, axis=2)
-                v_full = jnp.repeat(v, repeat, axis=2)
-            else:
-                k_full = k
-                v_full = v
+            k = jnp.concatenate([past_k, k], axis=1)
+            v = jnp.concatenate([past_v, v], axis=1)
 
-        q = q.transpose(0, 2, 1, 3)
-        k = k_full.transpose(0, 2, 1, 3)
-        v = v_full.transpose(0, 2, 1, 3)
+        cache_k, cache_v = k, v
 
-        q = q.astype(jnp.float32)
-        k = k.astype(jnp.float32)
+        # GQA: Repeat k/v to match query heads
+        if self.num_heads != self.num_kv_heads:
+            repeat = self.num_heads // self.num_kv_heads
+            k = jnp.repeat(k, repeat, axis=2)
+            v = jnp.repeat(v, repeat, axis=2)
+
+        # Attention computation
+        q = q.transpose(0, 2, 1, 3)  # [batch, heads, seq, head_dim]
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
         scale = 1.0 / jnp.sqrt(self.head_dim)
         scores = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
         if attention_mask is not None:
             scores += attention_mask
         
-        probs = jax.nn.softmax(scores, axis=-1)
+        # Attention computation
+        probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
         attn_out = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq, self.hidden_size)
 
-        attn_out = attn_out.astype(self.dtype)
-
+        # Output projection using ParallelDense
         attn_out = self.o_proj(attn_out)
 
-        return attn_out, (k_full, v_full)
+        return attn_out, (cache_k, cache_v)
 
-class StandardEmbed(nn.Module):
+def compute_cos_sin_cache(position_ids, head_dim, rope_theta=1000000.0):
+    pos = position_ids.astype(jnp.float32)  # [batch, seq]
+    dim = head_dim // 2
+    freqs = 1.0 / (rope_theta ** (jnp.arange(0, dim, dtype=jnp.float32) / dim))
+    t = pos[..., None] * freqs[None, None, :]
+    cos = jnp.cos(t)
+    sin = jnp.sin(t)
+    # Expand for broadcasting: [batch, seq, 1, dim]
+    cos = cos[..., None, :]
+    sin = sin[..., None, :]
+    return cos, sin
+
+def apply_rotary_emb(q, k, cos, sin):
+    # q, k: [batch, seq, heads, head_dim]
+    # cos, sin: [batch, seq, 1, dim] where dim = head_dim // 2
+    half_dim = q.shape[-1] // 2
+    q1, q2 = q[..., :half_dim], q[..., half_dim:]
+    k1, k2 = k[..., :half_dim], k[..., half_dim:]
+    # cos and sin are already [batch, seq, 1, dim], so they broadcast correctly
+    q_rot = jnp.concatenate([q1 * cos - q2 * sin, q1 * sin + q2 * cos], axis=-1)
+    k_rot = jnp.concatenate([k1 * cos - k2 * sin, k1 * sin + k2 * cos], axis=-1)
+    return q_rot, k_rot
+
+def make_causal_mask(q_len, k_len):
+    i = jnp.arange(q_len)[:, None]
+    j = jnp.arange(k_len)[None, :]
+    return jnp.where(i >= j - (k_len - q_len), 0, -1e9)
+
+class ParallelEmbed(nn.Module):
+    """Tensor parallel embedding layer that shards embeddings across vocab dimension"""
     num_embeddings: int
     features: int
     dtype: jnp.dtype = jnp.float32
@@ -198,6 +166,8 @@ class StandardEmbed(nn.Module):
     name: str = None
 
     def setup(self):
+        # For embeddings, we typically replicate rather than shard
+        # Using standard setup pattern to avoid scope issues
         self.embedding = self.param(
             "embedding",
             nn.initializers.normal(stddev=0.02),
@@ -206,10 +176,12 @@ class StandardEmbed(nn.Module):
         )
 
     def __call__(self, inputs):
+        # Standard embedding lookup
         embedding = jnp.asarray(self.embedding, self.dtype)
         return embedding[inputs.astype("i4")]
 
 class ParallelDense(nn.Module):
+    """Full parallel dense layer with tensor parallelism."""
     features: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -222,6 +194,7 @@ class ParallelDense(nn.Module):
         in_dim = x.shape[-1]
         out_dim = self.features
         
+        # Load full-size parameters (compatible with weight loading)
         kernel = self.param(
             "kernel", nn.initializers.lecun_normal(), (in_dim, out_dim), self.param_dtype
         )
@@ -232,13 +205,17 @@ class ParallelDense(nn.Module):
             bias = None
 
         def matmul_fn(x, k, b=None):
+            # Kernel is already sharded by input spec P(None, "mp")
+            # k is already the shard for this device
             local_out = jnp.einsum("bsd,df->bsf", x, k)
             
+            # Apply bias if provided (bias is also sharded by input spec)
             if b is not None:
                 local_out = local_out + b
             
             full_out = jax.lax.all_gather(local_out, axis_name="mp", axis=0)
             
+            # Reshape to combine all device outputs - use transpose like Llama
             result = jnp.reshape(
                 jnp.transpose(full_out, (1, 2, 0, 3)), (x.shape[0], x.shape[1], -1)
             )
@@ -270,6 +247,7 @@ class QwenMLP(nn.Module):
     def setup(self):
         c = self.config
         self.intermediate_size = c.get("intermediate_size", 4 * c["hidden_size"])
+        # Use ParallelDense for tensor parallelism
         self.gate_proj = ParallelDense(
             self.intermediate_size,
             dtype=self.dtype,
@@ -313,22 +291,17 @@ class QwenDecoderLayer(nn.Module):
         hidden_states = residual + self.mlp(hidden_states)
         return hidden_states, past_key_value
 
-class Qwen25ForCausalLM(FlaxQwenPreTrainedModel):
+class Qwen25ForCausalLM(nn.Module):
     config: Dict[str, Any]
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
         c = self.config
-        self.embed_tokens = StandardEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
+        self.embed_tokens = ParallelEmbed(c["vocab_size"], c["hidden_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="embed_tokens")
         self.layers = [QwenDecoderLayer(config=c, dtype=jnp.bfloat16, name=f"layers_{i}") for i in range(c["num_hidden_layers"])]
         self.norm = nn.RMSNorm(epsilon=c.get("rms_norm_eps", 1e-6), dtype=jnp.bfloat16, name="norm")
-        self.lm_head = nn.Dense(
-            c["vocab_size"],
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-            use_bias=False,
-            name="lm_head"
-        )
+        # Use ParallelDense for tensor parallelism (rationale: sharded for TP efficiency, but note: large vocab can cause bottlenecks; non-parallel alternative considered but kept for consistency)
+        self.lm_head = ParallelDense(c["vocab_size"], dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="lm_head")
 
     def __call__(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
         batch, seq = input_ids.shape
@@ -355,39 +328,6 @@ class Qwen25ForCausalLM(FlaxQwenPreTrainedModel):
         if return_dict:
             return {"logits": logits, "past_key_values": new_key_values}
         return logits
-    
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        batch, seq = input_ids.shape
-        
-        position_ids = kwargs.get("position_ids", None)
-        if position_ids is None:
-            if past_key_values is None or past_key_values[0] is None:
-                position_ids = jnp.arange(seq, dtype=jnp.int32)[None, :]
-            else:
-                position_ids = jnp.array([[past_key_values[0][0].shape[1]]], dtype=jnp.int32)
-        
-        if attention_mask is None:
-            key_len = seq if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + seq
-            attention_mask = jnp.ones((batch, 1, seq, key_len), dtype=jnp.float32)
-        
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-        }
-    
-    def update_inputs_for_generation(self, model_outputs, **kwargs):
-        current_position_ids = kwargs.get("position_ids", None)
-        if current_position_ids is not None:
-            next_position_ids = current_position_ids[:, -1:] + 1
-        else:
-            next_position_ids = None
-        
-        return {
-            "past_key_values": model_outputs["past_key_values"],
-            "position_ids": next_position_ids,
-        }
 
 # --- Weight Loading ---
 def get_param_path(name):
@@ -413,6 +353,7 @@ def transpose_if_needed(name, param):
     return param
 
 def load_params(model, model_path, dtype):
+    """Load model parameters from safetensors files."""
     print(f"Loading JAX model weights from {model_path}...")
     params = {"params": {}}
     loaded_count = 0
@@ -423,7 +364,7 @@ def load_params(model, model_path, dtype):
                     path = get_param_path(key)
                     if path:
                         param = f.get_tensor(key)
-                        param = jnp.array(param, dtype=jnp.bfloat16)
+                        param = jnp.array(param, dtype=jnp.bfloat16)  # Always load as bfloat16
                         param = transpose_if_needed(key, param)
                         d = params["params"]
                         for p in path[:-1]:

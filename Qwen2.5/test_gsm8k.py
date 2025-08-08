@@ -18,12 +18,30 @@ def extract_boxed_answer(text):
     return int(match.group(1)) if match else None
 
 def evaluate_gsm8k(model, params, tokenizer, num_samples=10):
-    dataset = load_dataset("gsm8k", "main", split="test")[:num_samples]
+    dataset = load_dataset("gsm8k", "main", split="test")
+    
+    # Debug: print dataset structure
+    print(f"Dataset type: {type(dataset)}")
+    print(f"Dataset features: {dataset.features}")
+    print(f"Dataset length: {len(dataset)}")
+    print(f"First example: {dataset[0]}")
+    
+    # Limit samples - use select to get the first num_samples rows
+    test_data = dataset.select(range(min(num_samples, len(dataset))))
     
     correct = 0
-    for example in dataset:
-        prompt = example["question"]
-        target = int(example["answer"].split("#### ")[-1])
+    for i, example in enumerate(test_data):
+        # Debug: print the example
+        print(f"Example {i}: {type(example)}")
+        print(f"Example content: {example}")
+        
+        # Handle the correct dataset format
+        if isinstance(example, dict):
+            prompt = example["question"]
+            target = int(example["answer"].split("#### ")[-1])
+        else:
+            print(f"Unexpected example type: {type(example)}")
+            continue
         
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
