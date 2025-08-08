@@ -25,9 +25,23 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("qwen25_gsm8k_eval")
 
 def extract_boxed_answer(text):
-    """Extract the final boxed answer from generated text."""
-    match = re.search(r'\boxed{([0-9]+)}', text)
-    return int(match.group(1)) if match else None
+    """Extract the final answer from GSM8K format text."""
+    # First try to find boxed format \boxed{...}
+    match = re.search(r'\\boxed{([0-9]+)}', text)
+    if match:
+        return int(match.group(1))
+    
+    # Then try GSM8K format #### number
+    match = re.search(r'####\s*([0-9]+)', text)
+    if match:
+        return int(match.group(1))
+    
+    # Finally try to find any number at the end of the text
+    match = re.search(r'([0-9]+)\s*$', text.strip())
+    if match:
+        return int(match.group(1))
+    
+    return None
 
 def generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_realtime=True):
     """Generate text for evaluation with memory monitoring and timing."""
@@ -113,28 +127,25 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
     dataset = load_dataset("gsm8k", "main", split="test")
     
     # Limit samples starting from start_index
-    test_data = list(dataset[start_index:start_index + num_samples])
-    
-    # Debug: check what we're getting
-    print(f"Debug: test_data type: {type(test_data)}")
-    print(f"Debug: test_data length: {len(test_data)}")
-    if len(test_data) > 0:
-        print(f"Debug: first example type: {type(test_data[0])}")
-        print(f"Debug: first example: {test_data[0]}")
+    test_data = dataset[start_index:start_index + num_samples]
     
     correct = 0
     total_time = 0
     total_tokens = 0
     peak_memory_usage = 0
     
-    for i, example in enumerate(test_data):
+    # Handle the dataset structure properly
+    questions = test_data["question"]
+    answers = test_data["answer"]
+    
+    for i in range(len(questions)):
         print(f"\n{'='*80}")
-        print(f"Processing sample {i+1}/{num_samples}")
+        print(f"Processing sample {i+1}/{len(questions)}")
         print(f"{'='*80}")
         
         # Use actual GSM8K questions
-        prompt = example["question"]
-        target = extract_boxed_answer(example["answer"])
+        prompt = questions[i]
+        target = extract_boxed_answer(answers[i])
         
         print(f"Question: {prompt}")
         print(f"Target answer: {target}")
@@ -180,7 +191,7 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--num_samples", type=int, default=10, help="Number of GSM8K samples to evaluate")
     parser.add_argument("--start_index", type=int, default=0, help="Starting index in the dataset")
-    parser.add_argument("--max_tokens", type=int, default=500, help="Maximum number of tokens to generate per sample")
+    parser.add_argument("--max_tokens", type=int, default=350, help="Maximum number of tokens to generate per sample")
     parser.add_argument("--single_device", action="store_true", help="Run in single-device mode for equivalence check")
     args = parser.parse_args()
 
