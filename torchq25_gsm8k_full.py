@@ -113,7 +113,8 @@ def generate_response_for_gsm8k(model, tokenizer, question, max_new_tokens=500):
     input_length = model_inputs.input_ids.shape[1]
     
     print(f"Input length: {input_length} tokens")
-    print("Starting generation...")
+    print("Starting generation with real-time token display...")
+    print("=" * 60)
     
     start_time = time.time()
     
@@ -122,6 +123,7 @@ def generate_response_for_gsm8k(model, tokenizer, question, max_new_tokens=500):
     generated_tokens = []
     current_text = ""
     
+    print("Generating tokens:")
     for i in range(max_new_tokens):
         # Generate next token
         with torch.no_grad():
@@ -137,14 +139,17 @@ def generate_response_for_gsm8k(model, tokenizer, question, max_new_tokens=500):
         new_token_text = tokenizer.decode(next_token, skip_special_tokens=True)
         current_text += new_token_text
         
+        # Show the numbered token in real-time
+        print(f"{i+1}: {new_token_text}", end="", flush=True)
+        
         # Check for end of sequence
         if next_token.item() == tokenizer.eos_token_id:
-            print(f"Stopping: EOS token reached at token {i+1}")
+            print(f"\n[EOS token reached]")
             break
         
         # Check for end of response markers (like in test_gsm8k.py)
         if "<|im_end|>" in new_token_text or "<|endoftext|>" in new_token_text:
-            print(f"Stopping: End marker reached at token {i+1}")
+            print(f"\n[End marker reached]")
             break
     
     generation_time = time.time() - start_time
@@ -155,8 +160,16 @@ def generate_response_for_gsm8k(model, tokenizer, question, max_new_tokens=500):
     tokens_generated = len(generated_tokens)
     tokens_per_second = tokens_generated / generation_time if generation_time > 0 else 0
     
+    print(f"\n" + "=" * 60)
     print(f"Generation completed in {generation_time:.2f} seconds")
     print(f"Generated {tokens_generated} tokens ({tokens_per_second:.1f} tokens/sec)")
+    print(f"Final response length: {len(response)} characters")
+    
+    print(f"\n" + "=" * 60)
+    print("COMPLETE RESPONSE:")
+    print("=" * 60)
+    print(response)
+    print("=" * 60)
     
     # Clean up
     del model_inputs, input_ids, generated_tokens
