@@ -140,7 +140,7 @@ def generate_response_for_gsm8k(model, tokenizer, question, max_new_tokens=500):
         current_text += new_token_text
         
         # Show the numbered token in real-time
-        print(f"{i+1}: {new_token_text}", end="", flush=True)
+        print(f"{i+1}: {new_token_text}")
         
         # Check for end of sequence
         if next_token.item() == tokenizer.eos_token_id:

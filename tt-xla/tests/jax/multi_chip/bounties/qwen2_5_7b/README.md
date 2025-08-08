@@ -58,11 +58,6 @@ Design rationale:
 - **Generation**: Autoregressive with greedy sampling; supports chat templates for Instruct.
 - **Optimization**: bfloat16, no x64 for speed; memory monitoring via psutil.
 
-## Sample Inputs/Outputs
-Example from generate_multi_chip.py (default prompt):
-- Input: "Question: Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
-- Output: [Generated reasoning and boxed answer, e.g., \boxed{85}].
-- Stats: Peak memory ~X GB, avg time per token ~Y seconds on simulated 1x8.
 
 **Custom prompt example:**
 ```bash
@@ -73,11 +68,6 @@ GSM8K sample (from test_gsm8k.py):
 - Question: [Dataset example]
 - Predicted: Extracted \boxed{answer}
 - Target: Ground truth
-
-## Multi-Device Compatibility
-Tested on simulated 1x8 (default). For others (e.g., 2x4):
-- Set device count to total (e.g., 8).
-- Modify mesh to 2D if needed: `Mesh(np.reshape(devices, (2,4)), ('row', 'col'))`; update in_specs/out_specs.
 
 ## Device Simulation
 To simulate different numbers of devices for tensor parallelism:
