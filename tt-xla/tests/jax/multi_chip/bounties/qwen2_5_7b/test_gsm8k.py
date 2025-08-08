@@ -112,14 +112,15 @@ def generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_re
 def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False, start_index=0, max_tokens=500):
     dataset = load_dataset("gsm8k", "main", split="test")
     
-    # Debug: print dataset structure
-    print(f"Dataset type: {type(dataset)}")
-    print(f"Dataset features: {dataset.features}")
-    print(f"Dataset length: {len(dataset)}")
-    print(f"First example: {dataset[0]}")
-    
     # Limit samples starting from start_index
-    test_data = dataset[start_index:start_index + num_samples]
+    test_data = list(dataset[start_index:start_index + num_samples])
+    
+    # Debug: check what we're getting
+    print(f"Debug: test_data type: {type(test_data)}")
+    print(f"Debug: test_data length: {len(test_data)}")
+    if len(test_data) > 0:
+        print(f"Debug: first example type: {type(test_data[0])}")
+        print(f"Debug: first example: {test_data[0]}")
     
     correct = 0
     total_time = 0
@@ -131,9 +132,9 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
         print(f"Processing sample {i+1}/{num_samples}")
         print(f"{'='*80}")
         
-        # Hardcode the Sam test scores question
-        prompt = "Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
-        target = 85  # (80 + 90 + x) / 3 = 85, so x = 85*3 - 80 - 90 = 255 - 170 = 85
+        # Use actual GSM8K questions
+        prompt = example["question"]
+        target = extract_boxed_answer(example["answer"])
         
         print(f"Question: {prompt}")
         print(f"Target answer: {target}")
