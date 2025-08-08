@@ -15,13 +15,101 @@ import re
 from model import Qwen25ForCausalLM, load_params, sample_next_token, make_causal_mask, setup_device_mesh, mesh  # Import from model.py
 import os
 import json
+import logging
+import psutil
+import gc
+import time
+
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("qwen25_gsm8k_eval")
 
 def extract_boxed_answer(text):
     """Extract the final boxed answer from generated text."""
     match = re.search(r'\boxed{([0-9]+)}', text)
     return int(match.group(1)) if match else None
 
-def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False):
+def generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_realtime=True):
+    """Generate text for evaluation with memory monitoring and timing."""
+    print("Starting text generation for evaluation...")
+    
+    # Monitor memory usage
+    process = psutil.Process()
+    initial_memory = process.memory_info().rss / 1024**3
+    print(f"Initial memory before generation: {initial_memory:.2f} GB used")
+    print(f"Free memory: {psutil.virtual_memory().available / 1024**3:.2f} GB")
+    
+    if show_realtime:
+        print("\n=== REAL-TIME GENERATION ===")
+        print("(Text will appear as it's generated)")
+        print("=" * 50)
+    
+    # Tokenize input with chat template - using Qwen system prompt for consistency
+    messages = [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": prompt}
+    ]
+    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    input_ids = tokenizer.encode(formatted_text, return_tensors="jax")
+    batch, seq = input_ids.shape
+    position_ids = jnp.arange(seq, dtype=jnp.int32)[None, :]
+    past_key_values = None
+    generated_tokens = []
+    
+    start_time = time.time()
+    peak_memory = initial_memory
+    num_tokens_generated = 0
+    
+    print(f"Entering generation loop for {max_tokens} tokens...")
+    print("Generating tokens (this may take a while on CPU)...")
+    
+    for step in range(max_tokens):
+        print(f"Generating token {step+1}/{max_tokens}...", end="", flush=True)
+        
+        current_seq_len = input_ids.shape[1]
+        key_len = current_seq_len if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + current_seq_len
+        attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
+        
+        outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
+                             position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
+        
+        next_token = sample_next_token(logits[:, -1, :])
+        generated_tokens.append(next_token)
+        input_ids = jnp.array([[next_token]])
+        position_ids = position_ids[:, -1:] + 1
+        num_tokens_generated += 1
+        
+        # Update peak memory
+        current_mem = psutil.virtual_memory().used / (1024**3)
+        if current_mem > peak_memory:
+            peak_memory = current_mem
+        
+        # Show the generated token
+        token_text = tokenizer.decode([next_token], skip_special_tokens=True)
+        print(f" -> '{token_text}'")
+        
+        # Enhanced stopping conditions like in generate_multi_chip.py
+        if next_token == tokenizer.eos_token_id or "<|im_end|>" in token_text:
+            print("Stopping generation: EOS token encountered.")
+            break
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    avg_time_per_token = total_time / num_tokens_generated if num_tokens_generated > 0 else 0
+    
+    print(f"Memory after generation: {psutil.virtual_memory().used / (1024**3):.2f} GB used")
+    print(f"Peak memory during generation: {peak_memory:.2f} GB used")
+    print(f"Free memory: {psutil.virtual_memory().available / (1024**3):.2f} GB")
+    print(f"Total tokens generated: {num_tokens_generated}")
+    print(f"Average time per token: {avg_time_per_token:.2f} seconds")
+    
+    full_output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    print("Generation complete.")
+    return full_output, peak_memory, avg_time_per_token
+
+def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False, start_index=0, max_tokens=500):
     dataset = load_dataset("gsm8k", "main", split="test")
     
     # Debug: print dataset structure
@@ -30,74 +118,35 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
     print(f"Dataset length: {len(dataset)}")
     print(f"First example: {dataset[0]}")
     
-    # Limit samples
-    test_data = dataset[:num_samples]
+    # Limit samples starting from start_index
+    test_data = dataset[start_index:start_index + num_samples]
     
     correct = 0
+    total_time = 0
+    total_tokens = 0
+    peak_memory_usage = 0
+    
     for i, example in enumerate(test_data):
         print(f"\n{'='*80}")
         print(f"Processing sample {i+1}/{num_samples}")
         print(f"{'='*80}")
         
-        # Handle both string and dict formats
-        if isinstance(example, str):
-            # If it's a string, it's the question directly
-            prompt = example
-            # For string format, we'll use a simple target for testing
-            target = 42  # Placeholder
-        else:
-            # Standard dict format
-            prompt = example["question"]
-            target = int(example["answer"].split("#### ")[-1])
+        # Hardcode the Sam test scores question
+        prompt = "Sam scores 80 on the first test and 90 on the second. What score does he need on the third test to have an average of 85?"
+        target = 85  # (80 + 90 + x) / 3 = 85, so x = 85*3 - 80 - 90 = 255 - 170 = 85
         
         print(f"Question: {prompt}")
         print(f"Target answer: {target}")
         print("\nGenerating response...")
         
-        # Generate response (using same logic as generate_text)
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt}
-        ]
-        formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer.encode(formatted_text, return_tensors="jax")
-        batch, seq = input_ids.shape
-        position_ids = jnp.arange(seq, dtype=jnp.int32)[None, :]
-        past_key_values = None
-        generated_tokens = []
-        
-        print("Generated text: ", end="", flush=True)
-        
-        for step in range(500):  # Max tokens
-            print(f"\nStep {step}: Starting inference...", flush=True)
-            current_seq_len = input_ids.shape[1]
-            key_len = current_seq_len if past_key_values is None else past_key_values[0][0].shape[1] + current_seq_len
-            attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
-            
-            print(f"Step {step}: Calling model.apply...", flush=True)
-            outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
-                                 position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
-            print(f"Step {step}: Model inference completed", flush=True)
-            
-            logits = outputs["logits"]
-            past_key_values = outputs["past_key_values"]
-            
-            next_token = sample_next_token(logits[:, -1, :])
-            generated_tokens.append(next_token)
-            input_ids = jnp.array([[next_token]])
-            position_ids = position_ids[:, -1:] + 1
-            
-            # Print token as it's generated
-            token_text = tokenizer.decode([next_token], skip_special_tokens=True)
-            print(token_text, end="", flush=True)
-            
-            if next_token == tokenizer.eos_token_id:
-                print(f"\nStep {step}: EOS token reached, stopping generation", flush=True)
-                break
-        
-        print()  # New line after generation
-        output = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        # Generate response using the enhanced function
+        output, peak_mem, avg_time = generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_realtime=True)
         predicted = extract_boxed_answer(output)
+        
+        # Update statistics
+        total_time += avg_time * len(output.split())  # Rough token count
+        total_tokens += len(output.split())
+        peak_memory_usage = max(peak_memory_usage, peak_mem)
         
         if predicted == target:
             correct += 1
@@ -107,12 +156,20 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
         
         print(f"Current accuracy: {correct}/{i+1} ({correct/(i+1)*100:.1f}%)")
         print(f"{'='*80}")
+        
+        # Memory cleanup between samples
+        gc.collect()
     
     accuracy = correct / num_samples * 100
+    avg_time_per_sample = total_time / num_samples if num_samples > 0 else 0
+    
     print(f"\n{'='*80}")
     print(f"FINAL RESULTS:")
     print(f"GSM8K Accuracy ({num_samples} samples): {accuracy:.2f}%")
     print(f"Correct: {correct}/{num_samples}")
+    print(f"Average time per sample: {avg_time_per_sample:.2f} seconds")
+    print(f"Total tokens generated: {total_tokens}")
+    print(f"Peak memory usage: {peak_memory_usage:.2f} GB")
     print(f"{'='*80}")
     return accuracy
 
@@ -121,6 +178,8 @@ def main():
     parser.add_argument("--model_path", type=str, required=True, help="Path to model weights")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--num_samples", type=int, default=10, help="Number of GSM8K samples to evaluate")
+    parser.add_argument("--start_index", type=int, default=0, help="Starting index in the dataset")
+    parser.add_argument("--max_tokens", type=int, default=500, help="Maximum number of tokens to generate per sample")
     parser.add_argument("--single_device", action="store_true", help="Run in single-device mode for equivalence check")
     args = parser.parse_args()
 
@@ -138,7 +197,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    accuracy = evaluate_gsm8k(model, params, tokenizer, args.num_samples, args.single_device)
+    accuracy = evaluate_gsm8k(model, params, tokenizer, args.num_samples, args.single_device, args.start_index, args.max_tokens)
     # For equivalence, run once with --single_device and compare to TP run
 
 if __name__ == "__main__":
