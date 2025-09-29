@@ -14,6 +14,9 @@ import os
 import gc
 from typing import Dict, Any
 
+# Enable shardy partitioner for better TT-XLA support
+jax.config.update("jax_use_shardy_partitioner", True)
+
 # Global mesh (set externally, e.g., in generate scripts)
 mesh = None
 
@@ -181,7 +184,7 @@ class ParallelEmbed(nn.Module):
         return embedding[inputs.astype("i4")]
 
 class ParallelDense(nn.Module):
-    """Full parallel dense layer with tensor parallelism."""
+    """Full parallel dense layer with tensor parallelism and explicit sharding annotations."""
     features: int
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -221,20 +224,21 @@ class ParallelDense(nn.Module):
             )
             return result
 
+        # Use explicit PartitionSpec annotations for better TT-XLA support
         if bias is not None:
             output = shard_map(
                 matmul_fn,
                 mesh=mesh,
-                in_specs=(None, P(None, "mp"), P("mp",)),
-                out_specs=P(None),
+                in_specs=(P(None, None), P(None, "mp"), P("mp",)),
+                out_specs=P(None, None),
                 check_rep=False,
             )(x, kernel, bias)
         else:
             output = shard_map(
                 matmul_fn,
                 mesh=mesh,
-                in_specs=(None, P(None, "mp")),
-                out_specs=P(None),
+                in_specs=(P(None, None), P(None, "mp")),
+                out_specs=P(None, None),
                 check_rep=False,
             )(x, kernel)
             
@@ -328,6 +332,90 @@ class Qwen25ForCausalLM(nn.Module):
         if return_dict:
             return {"logits": logits, "past_key_values": new_key_values}
         return logits
+
+# JIT-compiled model apply function for better caching and explicit parallelism
+def create_jit_model_apply(model):
+    """Create a JIT-compiled version of model.apply with proper sharding annotations."""
+    def jit_apply(params, input_ids, attention_mask=None, position_ids=None, past_key_values=None, return_dict=True):
+        return model.apply(params, input_ids, attention_mask, position_ids, past_key_values, return_dict)
+    
+    # Create JIT-compiled function with explicit sharding
+    jit_model_apply = jax.jit(
+        jit_apply,
+        in_shardings=(None, P(None, None), P(None, None, None, None), P(None, None), None),
+        out_shardings={"logits": P(None, None), "past_key_values": None}
+    )
+    return jit_model_apply
+
+def shard_params_for_jit(params, mesh):
+    """Shard parameters for JIT compilation with explicit PartitionSpec annotations."""
+    from jax.sharding import NamedSharding
+    
+    def shard_param(param, spec):
+        if spec is None:
+            return param
+        return jax.device_put(param, NamedSharding(mesh, spec))
+    
+    # Shard parameters according to their usage in the model
+    sharded_params = {}
+    for key, value in params.items():
+        if key == "params":
+            sharded_params[key] = {}
+            for subkey, subvalue in value.items():
+                if subkey == "embed_tokens":
+                    # Embeddings are replicated
+                    sharded_params[key][subkey] = subvalue
+                elif subkey == "norm":
+                    # Layer norm is replicated
+                    sharded_params[key][subkey] = subvalue
+                elif subkey.startswith("layers_"):
+                    # Layer parameters need sharding
+                    sharded_params[key][subkey] = {}
+                    for layer_key, layer_value in subvalue.items():
+                        if layer_key == "self_attn":
+                            sharded_params[key][subkey][layer_key] = {}
+                            for attn_key, attn_value in layer_value.items():
+                                if attn_key in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+                                    # Attention projections are sharded
+                                    sharded_params[key][subkey][layer_key][attn_key] = {}
+                                    for proj_key, proj_value in attn_value.items():
+                                        if proj_key == "kernel":
+                                            sharded_params[key][subkey][layer_key][attn_key][proj_key] = shard_param(proj_value, P(None, "mp"))
+                                        elif proj_key == "bias":
+                                            sharded_params[key][subkey][layer_key][attn_key][proj_key] = shard_param(proj_value, P("mp",))
+                                        else:
+                                            sharded_params[key][subkey][layer_key][attn_key][proj_key] = proj_value
+                                else:
+                                    sharded_params[key][subkey][layer_key][attn_key] = attn_value
+                        elif layer_key == "mlp":
+                            sharded_params[key][subkey][layer_key] = {}
+                            for mlp_key, mlp_value in layer_value.items():
+                                if mlp_key in ["gate_proj", "up_proj", "down_proj"]:
+                                    # MLP projections are sharded
+                                    sharded_params[key][subkey][layer_key][mlp_key] = {}
+                                    for proj_key, proj_value in mlp_value.items():
+                                        if proj_key == "kernel":
+                                            sharded_params[key][subkey][layer_key][mlp_key][proj_key] = shard_param(proj_value, P(None, "mp"))
+                                        else:
+                                            sharded_params[key][subkey][layer_key][mlp_key][proj_key] = proj_value
+                                else:
+                                    sharded_params[key][subkey][layer_key][mlp_key] = mlp_value
+                        else:
+                            sharded_params[key][subkey][layer_key] = layer_value
+                elif subkey == "lm_head":
+                    # LM head is sharded
+                    sharded_params[key][subkey] = {}
+                    for head_key, head_value in subvalue.items():
+                        if head_key == "kernel":
+                            sharded_params[key][subkey][head_key] = shard_param(head_value, P(None, "mp"))
+                        else:
+                            sharded_params[key][subkey][head_key] = head_value
+                else:
+                    sharded_params[key][subkey] = subvalue
+        else:
+            sharded_params[key] = value
+    
+    return sharded_params
 
 # --- Weight Loading ---
 def get_param_path(name):

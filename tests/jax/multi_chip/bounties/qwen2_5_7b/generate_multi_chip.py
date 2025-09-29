@@ -14,13 +14,13 @@ import jax.numpy as jnp
 from transformers import AutoTokenizer
 import os
 import json
-from model import Qwen25ForCausalLM, setup_device_mesh, load_params, sample_next_token, mesh  # Import from model.py
+from model import Qwen25ForCausalLM, setup_device_mesh, load_params, sample_next_token, create_jit_model_apply, shard_params_for_jit, mesh  # Import from model.py
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("qwen25_generate_multi_chip")
 
-def generate_text(model, params, tokenizer, max_tokens, prompt, show_realtime=True):
+def generate_text(model, jit_model_apply, params, tokenizer, max_tokens, prompt, show_realtime=True):
     print("Starting text generation...")
     
     # Monitor memory usage
@@ -60,9 +60,9 @@ def generate_text(model, params, tokenizer, max_tokens, prompt, show_realtime=Tr
         key_len = current_seq_len if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + current_seq_len
         attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
         
-        # Use model.apply directly since ParallelDense handles tensor parallelism
-        outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
-                             position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
+        # Use JIT-compiled model.apply for better caching and explicit parallelism
+        outputs = jit_model_apply(params, input_ids=input_ids, attention_mask=attention_mask, 
+                                 position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         
@@ -120,12 +120,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
+    # Create JIT-compiled model apply function
+    jit_model_apply = create_jit_model_apply(model)
+    
+    # Shard parameters for JIT compilation
+    params = shard_params_for_jit(params, mesh)
+    
     print(f"\n{'='*80}")
     print("Custom Prompt Generation:")
     print(f"Prompt: {args.prompt}")
     # Generate with specified max tokens
     show_realtime = not args.no_realtime
-    output, peak_mem, avg_time_per_token = generate_text(model, params, tokenizer, args.max_tokens, args.prompt, show_realtime)
+    output, peak_mem, avg_time_per_token = generate_text(model, jit_model_apply, params, tokenizer, args.max_tokens, args.prompt, show_realtime)
     print(f"Output: {output}")
     print(f"Peak memory: {peak_mem:.2f} GB")
     print(f"Avg time per token: {avg_time_per_token:.4f} seconds")

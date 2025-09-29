@@ -57,6 +57,9 @@ Design rationale:
 - **Sharding**: Uses `shard_map` with "mp" axis; all-gather combines local outputs.
 - **Generation**: Autoregressive with greedy sampling; supports chat templates for Instruct.
 - **Optimization**: bfloat16, no x64 for speed; memory monitoring via psutil.
+- **JIT Compilation**: Model.apply wrapped with jax.jit for better caching and explicit parallelism.
+- **Shardy Partitioner**: Uses shardy partitioner for better TT-XLA support and automatic parallelization.
+- **Explicit Sharding**: PartitionSpec annotations for weights/inputs to leverage TT-XLA's automatic pipeline.
 
 
 **Custom prompt example:**

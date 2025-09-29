@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import re
-from model import Qwen25ForCausalLM, load_params, sample_next_token, make_causal_mask, setup_device_mesh, mesh  # Import from model.py
+from model import Qwen25ForCausalLM, load_params, sample_next_token, make_causal_mask, setup_device_mesh, create_jit_model_apply, shard_params_for_jit, mesh  # Import from model.py
 import os
 import json
 import logging
@@ -43,7 +43,7 @@ def extract_boxed_answer(text):
     
     return None
 
-def generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_realtime=True):
+def generate_text_for_eval(model, jit_model_apply, params, tokenizer, max_tokens, prompt, show_realtime=True):
     """Generate text for evaluation with memory monitoring and timing."""
     print("Starting text generation for evaluation...")
     
@@ -84,8 +84,8 @@ def generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_re
         key_len = current_seq_len if past_key_values is None or past_key_values[0] is None else past_key_values[0][0].shape[1] + current_seq_len
         attention_mask = jnp.ones((batch, 1, current_seq_len, key_len), dtype=jnp.float32)
         
-        outputs = model.apply(params, input_ids=input_ids, attention_mask=attention_mask, 
-                             position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
+        outputs = jit_model_apply(params, input_ids=input_ids, attention_mask=attention_mask, 
+                                 position_ids=position_ids, past_key_values=past_key_values, return_dict=True)
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
         
@@ -123,7 +123,7 @@ def generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_re
     print("Generation complete.")
     return full_output, peak_memory, avg_time_per_token
 
-def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False, start_index=0, max_tokens=500):
+def evaluate_gsm8k(model, jit_model_apply, params, tokenizer, num_samples=10, single_device=False, start_index=0, max_tokens=500):
     dataset = load_dataset("gsm8k", "main", split="test")
     
     # Limit samples starting from start_index
@@ -152,7 +152,7 @@ def evaluate_gsm8k(model, params, tokenizer, num_samples=10, single_device=False
         print("\nGenerating response...")
         
         # Generate response using the enhanced function
-        output, peak_mem, avg_time = generate_text_for_eval(model, params, tokenizer, max_tokens, prompt, show_realtime=True)
+        output, peak_mem, avg_time = generate_text_for_eval(model, jit_model_apply, params, tokenizer, max_tokens, prompt, show_realtime=True)
         predicted = extract_boxed_answer(output)
         
         # Update statistics
@@ -209,7 +209,13 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     params = load_params(model, args.model_path, dtype)
     
-    accuracy = evaluate_gsm8k(model, params, tokenizer, args.num_samples, args.single_device, args.start_index, args.max_tokens)
+    # Create JIT-compiled model apply function
+    jit_model_apply = create_jit_model_apply(model)
+    
+    # Shard parameters for JIT compilation
+    params = shard_params_for_jit(params, mesh)
+    
+    accuracy = evaluate_gsm8k(model, jit_model_apply, params, tokenizer, args.num_samples, args.single_device, args.start_index, args.max_tokens)
     # For equivalence, run once with --single_device and compare to TP run
 
 if __name__ == "__main__":
