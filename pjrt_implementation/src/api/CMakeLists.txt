@@ -41,6 +41,7 @@ add_library(TTPJRTApi
 target_include_directories(TTPJRTApi PUBLIC
     ${TTMLIR_TOOLCHAIN_DIR}/src/shardy
     ${TTMLIR_TOOLCHAIN_DIR}/src/stablehlo
+    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal/tt_metal/third_party/tracy/public
 )
 
 target_link_libraries(TTPJRTApi
@@ -53,6 +54,13 @@ PRIVATE
 PUBLIC
     TTPJRTUtils
 )
+
+# Enable Tracy profiling if requested
+if(ENABLE_TRACY)
+    target_compile_definitions(TTPJRTApi PUBLIC TRACY_ENABLE)
+    target_link_libraries(TTPJRTApi PUBLIC tracy)
+    message(STATUS "Tracy profiling enabled")
+endif()
 
 target_link_directories(TTPJRTApi PUBLIC
     ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/install/lib
