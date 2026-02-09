@@ -171,7 +171,6 @@ private:
   // Computes the appropriate fabric config for the given mesh shape based on
   // the system descriptor's chip channels and coordinates. Returns FABRIC_1D_RING
   // if all rows and columns have wraparound connections, otherwise FABRIC_1D.
-  // Returns DISABLED for single-chip configurations.
   tt::runtime::FabricConfig
   computeFabricConfig(const std::vector<uint32_t> &mesh_shape);
 

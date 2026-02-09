@@ -188,7 +188,6 @@ ClientInstance::ClientInstance()
   m_cached_system_descriptor_path =
       std::filesystem::temp_directory_path().concat(
           "/tt_pjrt_system_descriptor");
-  DLOG_F(LOG_DEBUG, "Using system desc path %s", m_cached_system_descriptor_path.c_str());
 }
 
 ClientInstance::~ClientInstance() {
