@@ -253,121 +253,6 @@ tt_pjrt_status ClientInstance::populateDevices() {
 
   m_system_descriptor = tt::runtime::getCurrentSystemDesc();
 
-  DLOG_F(LOG_DEBUG, "SystemDesc: version=%s, fileIdentifier=%s, schemaHash=%s, "
-         "ttmlirGitHash=%s",
-         m_system_descriptor.getVersion().c_str(),
-         m_system_descriptor.getFileIdentifier().c_str(),
-         m_system_descriptor.getSchemaHash().c_str(),
-         m_system_descriptor.getTTMLIRGitHash().c_str());
-
-  const auto *sys_desc = m_system_descriptor.get();
-
-  // Log CPU descriptors.
-  if (sys_desc->cpu_descs()) {
-    DLOG_F(LOG_DEBUG, "SystemDesc: %u CPU descriptor(s)",
-           sys_desc->cpu_descs()->size());
-    for (size_t i = 0; i < sys_desc->cpu_descs()->size(); ++i) {
-      auto cpu = sys_desc->cpu_descs()->Get(i);
-      DLOG_F(LOG_DEBUG, "  CPU[%zu]: role=%d, target_triple=%s", i,
-             static_cast<int>(cpu->role()),
-             cpu->target_triple() ? cpu->target_triple()->c_str() : "null");
-    }
-  }
-
-  // Log chip descriptors.
-  if (sys_desc->chip_descs()) {
-    DLOG_F(LOG_DEBUG, "SystemDesc: %u chip descriptor(s)",
-           sys_desc->chip_descs()->size());
-    for (size_t i = 0; i < sys_desc->chip_descs()->size(); ++i) {
-      auto chip = sys_desc->chip_descs()->Get(i);
-      DLOG_F(LOG_DEBUG,
-             "  ChipDesc[%zu]: arch=%s, grid_size=(%u,%u), "
-             "coord_translation_offsets=(%u,%u), l1_size=%lu, "
-             "num_dram_channels=%u, dram_channel_size=%lu",
-             i, ::tt::target::EnumNameArch(chip->arch()),
-             chip->grid_size() ? chip->grid_size()->x() : 0,
-             chip->grid_size() ? chip->grid_size()->y() : 0,
-             chip->coord_translation_offsets()
-                 ? chip->coord_translation_offsets()->x()
-                 : 0,
-             chip->coord_translation_offsets()
-                 ? chip->coord_translation_offsets()->y()
-                 : 0,
-             chip->l1_size(), chip->num_dram_channels(),
-             chip->dram_channel_size());
-      DLOG_F(LOG_DEBUG,
-             "  ChipDesc[%zu]: noc_l1_address_align_bytes=%u, "
-             "pcie_address_align_bytes=%u, noc_dram_address_align_bytes=%u, "
-             "l1_unreserved_base=%u, erisc_l1_unreserved_base=%u, "
-             "dram_unreserved_base=%u, dram_unreserved_end=%u",
-             i, chip->noc_l1_address_align_bytes(),
-             chip->pcie_address_align_bytes(),
-             chip->noc_dram_address_align_bytes(), chip->l1_unreserved_base(),
-             chip->erisc_l1_unreserved_base(), chip->dram_unreserved_base(),
-             chip->dram_unreserved_end());
-      DLOG_F(LOG_DEBUG,
-             "  ChipDesc[%zu]: num_cbs=%u, num_compute_threads=%u, "
-             "num_datamovement_threads=%u, dst_physical_size_tiles=%u",
-             i, chip->num_cbs(), chip->num_compute_threads(),
-             chip->num_datamovement_threads(), chip->dst_physical_size_tiles());
-    }
-  }
-
-  // Log chip descriptor indices.
-  if (sys_desc->chip_desc_indices()) {
-    DLOG_F(LOG_DEBUG, "SystemDesc: %u chip_desc_indices",
-           sys_desc->chip_desc_indices()->size());
-    for (size_t i = 0; i < sys_desc->chip_desc_indices()->size(); ++i) {
-      DLOG_F(LOG_DEBUG, "  chip_desc_indices[%zu] = %u", i,
-             sys_desc->chip_desc_indices()->Get(i));
-    }
-  }
-
-  // Log chip capabilities.
-  if (sys_desc->chip_capabilities()) {
-    DLOG_F(LOG_DEBUG, "SystemDesc: %u chip_capabilities",
-           sys_desc->chip_capabilities()->size());
-    for (size_t i = 0; i < sys_desc->chip_capabilities()->size(); ++i) {
-      auto cap = sys_desc->chip_capabilities()->Get(i);
-      DLOG_F(LOG_DEBUG, "  chip_capabilities[%zu] = %d (HostMMIO=%s)", i,
-             static_cast<int>(cap),
-             (static_cast<int>(cap) &
-              static_cast<int>(::tt::target::ChipCapability::HostMMIO))
-                 ? "true"
-                 : "false");
-    }
-  }
-
-  // Log chip coordinates.
-  if (sys_desc->chip_coords()) {
-    DLOG_F(LOG_DEBUG, "SystemDesc: %u chip_coords",
-           sys_desc->chip_coords()->size());
-    for (size_t i = 0; i < sys_desc->chip_coords()->size(); ++i) {
-      auto coord = sys_desc->chip_coords()->Get(i);
-      DLOG_F(LOG_DEBUG,
-             "  chip_coords[%zu]: rack=%u, shelf=%u, y=%u, x=%u", i,
-             coord->rack(), coord->shelf(), coord->y(), coord->x());
-    }
-  }
-
-  // Log chip channels (device-to-device connections).
-  if (sys_desc->chip_channels()) {
-    DLOG_F(LOG_DEBUG, "SystemDesc: %u chip_channels",
-           sys_desc->chip_channels()->size());
-    for (size_t i = 0; i < sys_desc->chip_channels()->size(); ++i) {
-      auto ch = sys_desc->chip_channels()->Get(i);
-      DLOG_F(LOG_DEBUG,
-             "  chip_channels[%zu]: device_id0=%u "
-             "eth_core0=(%u,%u) <-> device_id1=%u eth_core1=(%u,%u)",
-             i, ch->device_id0(), ch->ethernet_core_coord0().x(),
-             ch->ethernet_core_coord0().y(), ch->device_id1(),
-             ch->ethernet_core_coord1().x(),
-             ch->ethernet_core_coord1().y());
-    }
-  } else {
-    DLOG_F(LOG_DEBUG, "SystemDesc: no chip_channels present");
-  }
-
   m_system_descriptor.store(m_cached_system_descriptor_path.data());
   if (std::filesystem::exists(m_cached_system_descriptor_path) == false) {
     DLOG_F(ERROR,
@@ -375,8 +260,6 @@ tt_pjrt_status ClientInstance::populateDevices() {
            m_cached_system_descriptor_path.c_str());
     return tt_pjrt_status::kInternal;
   }
-  DLOG_F(LOG_DEBUG, "SystemDesc: stored to %s",
-         m_cached_system_descriptor_path.c_str());
 
   size_t devices_count = tt::runtime::getNumAvailableDevices();
   m_devices.reserve(devices_count);
@@ -385,7 +268,6 @@ tt_pjrt_status ClientInstance::populateDevices() {
 
   for (size_t i = 0; i < devices_count; ++i) {
     int global_device_id = m_system_descriptor->chip_desc_indices()->Get(i);
-    DLOG_F(LOG_DEBUG, "Device %d: global_device_id=%d", i, global_device_id);
     int local_device_id = i;
 
     // For now, just make all devices addressable.
@@ -523,57 +405,42 @@ void ClientInstance::materializeAllBuffersToHost() {
 
 tt::runtime::FabricConfig
 ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
-  DLOG_F(LOG_DEBUG, "Computing fabric config...");
-  // Calculate total devices in mesh
   uint32_t total_devices = 1;
   for (uint32_t dim : mesh_shape) {
     total_devices *= dim;
   }
 
-  // Single chip doesn't need fabric
+  // Single chip doesn't need fabric.
   if (total_devices <= 1) {
-    DLOG_F(LOG_DEBUG, "computeFabricConfig: single chip, returning DISABLED");
     return tt::runtime::FabricConfig::DISABLED;
   }
 
-  // Build adjacency set from chip_channels (physical connections between devices)
   std::set<std::pair<uint32_t, uint32_t>> connections;
   auto chip_channels = m_system_descriptor->chip_channels();
-  DLOG_F(LOG_DEBUG, "Using chip channels %s", chip_channels ? "present" : "not present");
   if (chip_channels) {
-    DLOG_F(LOG_DEBUG, "Found %u chip channels in system descriptor", chip_channels->size());
     for (size_t i = 0; i < chip_channels->size(); ++i) {
-      DLOG_F(LOG_DEBUG, "Processing chip channel %u", i);
       auto channel = chip_channels->Get(i);
       uint32_t id0 = channel->device_id0();
       uint32_t id1 = channel->device_id1();
-      // Store as ordered pair
       if (id0 > id1) {
         std::swap(id0, id1);
       }
-      // print connection
-      DLOG_F(LOG_DEBUG, "Found connection between device %u and %u", id0, id1);
       connections.insert({id0, id1});
     }
   }
 
-  // Get mesh dimensions (assuming 2D mesh: [rows, cols])
   uint32_t num_rows = mesh_shape.size() >= 1 ? mesh_shape[0] : 1;
   uint32_t num_cols = mesh_shape.size() >= 2 ? mesh_shape[1] : total_devices;
 
-  // Get the logical-to-physical device mapping from tt-mlir runtime
-  // This uses SystemMesh internally and works without needing an open MeshDevice
+  // Get the logical-to-physical device mapping from tt-mlir runtime.
   std::vector<int> device_ids = tt::runtime::getMappedDeviceIds(mesh_shape);
 
-  // device_ids is in row-major order: index = row * num_cols + col
   auto get_device_at = [&device_ids, num_cols](uint32_t row,
                                                uint32_t col) -> uint32_t {
     int id = device_ids[row * num_cols + col];
-    // -1 indicates remote device, shouldn't happen in single-process mode
     return id >= 0 ? static_cast<uint32_t>(id) : 0;
   };
 
-  // Helper to check if two devices are connected
   auto are_connected = [&connections](uint32_t id0, uint32_t id1) {
     if (id0 > id1) {
       std::swap(id0, id1);
@@ -581,43 +448,39 @@ ClientInstance::computeFabricConfig(const std::vector<uint32_t> &mesh_shape) {
     return connections.count({id0, id1}) > 0;
   };
 
-  // Log device IDs and their positions
-  for (uint32_t row = 0; row < num_rows; ++row) {
-    for (uint32_t col = 0; col < num_cols; ++col) {
-      DLOG_F(LOG_DEBUG, "Mesh position (%u, %u) -> device ID %u", row, col,
-             get_device_at(row, col));
-    }
-  }
-
-  // Check row wraparound: for each row, check if first and last device connect
+  // Check row wraparound: for each row, check if first and last device connect.
   bool all_rows_ring = true;
   for (uint32_t row = 0; row < num_rows && all_rows_ring; ++row) {
-    if (num_cols > 1) {
-      uint32_t first_device = get_device_at(row, 0);
-      uint32_t last_device = get_device_at(row, num_cols - 1);
-      if (!are_connected(first_device, last_device)) {
-        DLOG_F(LOG_DEBUG,
-               "Row %u: no wraparound connection between device %u and %u", row,
-               first_device, last_device);
-        all_rows_ring = false;
-      }
+    if (num_cols <= 1) {
+      continue;
+    }
+    uint32_t first_device = get_device_at(row, 0);
+    uint32_t last_device = get_device_at(row, num_cols - 1);
+    if (!are_connected(first_device, last_device)) {
+      all_rows_ring = false;
     }
   }
 
-  // Check column wraparound: for each column, check if first and last connect
+  // Check column wraparound: for each column, check if first and last connect.
   bool all_cols_ring = true;
   for (uint32_t col = 0; col < num_cols && all_cols_ring; ++col) {
-    if (num_rows > 1) {
-      uint32_t first_device = get_device_at(0, col);
-      uint32_t last_device = get_device_at(num_rows - 1, col);
-      if (!are_connected(first_device, last_device)) {
-        DLOG_F(LOG_DEBUG,
-               "Col %u: no wraparound connection between device %u and %u", col,
-               first_device, last_device);
-        all_cols_ring = false;
-      }
+    if (num_rows <= 1) {
+      continue;
+    }
+    uint32_t first_device = get_device_at(0, col);
+    uint32_t last_device = get_device_at(num_rows - 1, col);
+    if (!are_connected(first_device, last_device)) {
+      all_cols_ring = false;
     }
   }
+
+  // Save per-axis fabric config.
+  m_per_axis_fabric_config = {
+      all_rows_ring ? tt::runtime::FabricConfig::FABRIC_1D_RING
+                    : tt::runtime::FabricConfig::FABRIC_1D,
+      all_cols_ring ? tt::runtime::FabricConfig::FABRIC_1D_RING
+                    : tt::runtime::FabricConfig::FABRIC_1D,
+  };
 
   // Use FABRIC_1D_RING only if ALL rows and ALL columns have wraparound
   tt::runtime::FabricConfig result =

@@ -979,6 +979,16 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
 
   options.meshShape = {devices_mesh_shape[0], devices_mesh_shape[1]};
 
+  const auto &per_axis_fabric_config = client_instance->perAxisFabricConfig();
+  std::vector<mlir::tt::ttcore::Topology> devices_mesh_topology;
+  for (const auto &axis_config : per_axis_fabric_config) {
+    devices_mesh_topology.push_back(
+        axis_config == tt::runtime::FabricConfig::FABRIC_1D_RING
+            ? mlir::tt::ttcore::Topology::Ring
+            : mlir::tt::ttcore::Topology::Linear);
+  }
+  options.meshTopology = devices_mesh_topology;
+
   // Use the `options.devicePtr` to pass the device pointer to the optimizer in
   // order to avoid closing and reopening the device afterwards.
   // Optimizer is enabled for optimization_level >= 1

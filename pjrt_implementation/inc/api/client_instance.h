@@ -128,6 +128,11 @@ public:
   // Returns parent mesh.
   std::optional<tt::runtime::Device> &parentMesh() { return m_parent_mesh; };
 
+  // Returns per-axis fabric config for the current mesh.
+  const std::vector<tt::runtime::FabricConfig> &perAxisFabricConfig() const {
+    return m_per_axis_fabric_config;
+  }
+
   // Returns parent mesh.
   const std::optional<tt::runtime::Device> &parentMesh() const {
     return m_parent_mesh;
@@ -220,6 +225,9 @@ private:
   // Current fabric config for the mesh device.
   tt::runtime::FabricConfig m_current_fabric_config =
       tt::runtime::FabricConfig::FABRIC_1D;
+
+  // Per-axis fabric config for the current mesh device.
+  std::vector<tt::runtime::FabricConfig> m_per_axis_fabric_config;
 
   // Optimizer submesh device (created from m_parent_mesh for optimizer passes).
   std::optional<tt::runtime::Device> m_optimizer_submesh;
