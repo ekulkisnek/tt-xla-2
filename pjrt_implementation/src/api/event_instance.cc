@@ -11,6 +11,7 @@
 #include "api/event_instance.h"
 
 // c++ standard library includes
+#include <exception>
 #include <stdexcept>
 
 // tt-xla includes
@@ -32,6 +33,13 @@ EventInstance::EventInstance()
 EventInstance::~EventInstance() {
   if (!isReady()) {
     DLOG_F(WARNING, "Destroying the event before it is ready!");
+  }
+  if (m_calling_callbacks) {
+    LOG_F(WARNING,
+          "Destroying the event while callbacks are being executed! This may "
+          "lead "
+          "to undefined behavior if the callback tries to access the event.");
+    std::terminate();
   }
 }
 
@@ -69,6 +77,7 @@ void EventInstance::markAsReady(tt_pjrt_status status) {
     m_status = status;
     // Copy callbacks while holding lock
     callbacks_to_execute = std::move(m_on_ready_callbacks);
+    m_calling_callbacks = true;
     m_ready_condition.notify_all();
   }
 
@@ -77,6 +86,7 @@ void EventInstance::markAsReady(tt_pjrt_status status) {
     callback.callback_function(*ErrorInstance::makeError(status).release(),
                                callback.user_arg);
   }
+  m_calling_callbacks = false;
 }
 
 void EventInstance::await() {
@@ -106,8 +116,10 @@ void EventInstance::onReady(PJRT_Event_OnReadyCallback callback_function,
 
   std::unique_lock<std::mutex> ready_lock(m_ready_mutex);
   if (m_ready) {
+    m_calling_callbacks = true;
     ready_lock.unlock();
     callback_function(getErrorFromStatus(), user_arg);
+    m_calling_callbacks = false;
   } else {
     m_on_ready_callbacks.push_back({callback_function, user_arg});
   }

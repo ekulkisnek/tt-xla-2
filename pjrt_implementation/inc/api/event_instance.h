@@ -12,6 +12,7 @@
 #define TT_XLA_PJRT_IMPLEMENTATION_INC_API_EVENT_INSTANCE_H_
 
 // c++ standard library includes
+#include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -110,6 +111,8 @@ private:
   // XLA PJRT client destroys event immediately after it sets callback on it.
   // https://github.com/openxla/xla/issues/25172
   bool m_indestructible;
+
+  std::atomic<bool> m_calling_callbacks{false};
 };
 
 namespace internal {
