@@ -85,9 +85,9 @@ endif()
 
 link_directories(${TTMLIR_TOOLCHAIN_DIR}//lib)
 
-if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    add_definitions(-DLOGURU_DEBUG_LOGGING=1)
-endif()
+#if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+add_definitions(-DLOGURU_DEBUG_LOGGING=1)
+#endif()
 
 add_subdirectory(pjrt_implementation/src)
 add_subdirectory(third_party)

@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 #
 # SPDX-License-Identifier: Apache-2.0
+import os
+
 import pytest
 import vllm
+
+os.environ["TTXLA_LOGGER_LEVEL"] = "DEBUG"
 
 
 @pytest.mark.push
@@ -44,7 +48,9 @@ def test_tensor_parallel_generation_n300(model_name: str):
 @pytest.mark.parametrize(
     ["model_name", "enable_const_eval", "experimental_enable_weight_bfp8_conversion"],
     [
+        pytest.param("Qwen/Qwen3-0.6B", True, False),
         pytest.param("Qwen/Qwen3-0.6B", False, False),
+        pytest.param("meta-llama/Llama-3.2-3B", False, False),
     ],
 )
 def test_tensor_parallel_generation_llmbox_small(
@@ -78,9 +84,6 @@ def test_tensor_parallel_generation_llmbox_small(
 @pytest.mark.nightly
 @pytest.mark.tensor_parallel
 @pytest.mark.llmbox
-@pytest.mark.skip(
-    reason="vLLM TP test leave the device in bad state after successful execution; causing subsequent tests to fail. https://github.com/tenstorrent/tt-xla/issues/3266"
-)
 @pytest.mark.parametrize(
     ["model_name", "enable_const_eval", "experimental_enable_weight_bfp8_conversion"],
     [
