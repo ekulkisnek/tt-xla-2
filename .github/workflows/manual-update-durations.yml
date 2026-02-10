@@ -66,7 +66,9 @@ jobs:
           source venv/activate
 
           # Install the wheel
-          pip install push-main_artifacts_*/xla-whl-release-457b737/*.whl
+          WHEEL_PATH=$(find push-main_artifacts_*/xla-whl-release-*/*.whl | head -n 1)
+          echo "Installing wheel: $WHEEL_PATH"
+          pip install "$WHEEL_PATH"
 
           ls -lash
           # shoudln't need python3 in the venv
