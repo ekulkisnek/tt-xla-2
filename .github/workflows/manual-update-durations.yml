@@ -51,10 +51,12 @@ jobs:
             venv
             examples
       - name: Download artifact and setup venv
+        shell: bash
         run: |
           echo "hello"
           hostname
           touch hello
+          ls -lash
 
 
           # Download the artifact into the cwd
@@ -65,9 +67,9 @@ jobs:
 
           # Install the wheel
           pip install push-main_artifacts_*/xla-whl-release-457b737/*.whl
-        
+
           ls -lash
           # shoudln't need python3 in the venv
           python3 examples/pytorch/mnist.py
-          
+
           sleep 6000
