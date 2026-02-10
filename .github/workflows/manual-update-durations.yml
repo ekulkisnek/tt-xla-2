@@ -8,8 +8,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  packages: write
+  packages: read
   checks: write
+  contents: read
 
 env:
   GH_TOKEN: ${{ github.token }}
