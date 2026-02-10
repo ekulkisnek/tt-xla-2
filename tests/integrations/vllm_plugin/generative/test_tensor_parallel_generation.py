@@ -1,8 +1,12 @@
 # SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
 #
 # SPDX-License-Identifier: Apache-2.0
+import os
+
 import pytest
 import vllm
+
+os.environ["TTXLA_LOGGER_LEVEL"] = "INFO"
 
 
 @pytest.mark.push
@@ -32,6 +36,7 @@ def test_tensor_parallel_generation_n300(model_name: str):
     print(f"prompt: {prompts[0]}, output: {output_text}")
 
 
+@pytest.mark.nightly
 @pytest.mark.push
 @pytest.mark.tensor_parallel
 @pytest.mark.llmbox
