@@ -21,7 +21,7 @@ jobs:
   update_test_durations:
     runs-on: multihost_experimental
     container:
-      image: tt-xla-ci:latest
+      image: ghcr.io/tenstorrent/tt-xla/tt-xla-ci-ubuntu-22-04:latest
       options: --device /dev/tenstorrent
       volumes:
         - /dev/hugepages:/dev/hugepages
