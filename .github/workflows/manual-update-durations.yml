@@ -58,7 +58,7 @@ jobs:
 
 
           # Download the artifact into the cwd
-          python .github/scripts/download_artifacts.py --workflow push-main.yml --branch main --filter xla-whl-release
+          python3 .github/scripts/download_artifacts.py --workflow push-main.yml --branch main --filter xla-whl-release
 
           # Create venv
           source venv/activate
@@ -67,6 +67,7 @@ jobs:
           pip install push-main_artifacts_*/xla-whl-release-457b737/*.whl
         
           ls -lash
-          python examples/pytorch/mnist.py
+          # shoudln't need python3 in the venv
+          python3 examples/pytorch/mnist.py
           
           sleep 6000
