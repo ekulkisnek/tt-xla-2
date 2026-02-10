@@ -11,16 +11,61 @@ permissions:
   packages: write
   checks: write
 
+env:
+  GH_TOKEN: ${{ github.token }}
+  TTMLIR_TOOLCHAIN_DIR: /opt/ttmlir-toolchain
+  TT_XLA_CI: 1
+
 jobs:
   update_test_durations:
     runs-on: multihost_experimental
     container:
       image: ghcr.io/tenstorrent/tt-xla-ci:latest
+      options: --device /dev/tenstorrent
+      volumes:
+        - /dev/hugepages:/dev/hugepages
+        - /dev/hugepages-1G:/dev/hugepages-1G
+        - /etc/udev/rules.d:/etc/udev/rules.d
+        - /lib/modules:/lib/modules
+        - /opt/tt_metal_infra/provisioning/provisioning_env:/opt/tt_metal_infra/provisioning/provisioning_env
+        - /mnt/dockercache:/mnt/dockercache
     steps:
+      - name: Mark repo as safe for git
+        run: |
+          git config --global --add safe.directory /__w/tt-xla/tt-xla
+          git config --global --add safe.directory /__w/tt-xla/tt-xla/third_party/tt_forge_models
       - uses: actions/checkout@v4
-      - name: Run hello script
+        with:
+          submodules: recursive
+          sparse-checkout: |
+            .github/scripts
+            .gitmodules
+            .test_durations
+            pjrt_implementation
+            third_party/pjrt_c_api
+            pytest.ini
+            python_package/requirements.txt
+            integrations/vllm_plugin/requirements-vllm-plugin.txt
+            tests
+            venv
+            examples
+      - name: Download artifact and setup venv
         run: |
           echo "hello"
           hostname
           touch hello
+
+
+          # Download the artifact into the cwd
+          python .github/scripts/download_artifacts.py --workflow push-main.yml --branch main --filter xla-whl-release
+
+          # Create venv
+          source venv/activate
+
+          # Install the wheel
+          pip install push-main_artifacts_*/xla-whl-release-457b737/*.whl
+        
+          ls -lash
+          python examples/pytorch/mnist.py
+          
           sleep 6000
