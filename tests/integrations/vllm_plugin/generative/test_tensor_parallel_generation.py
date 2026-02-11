@@ -118,3 +118,4 @@ def test_tensor_parallel_generation_llmbox_large(
 
     output_text = llm.generate(prompts, sampling_params)[0].outputs[0].text
     print(f"prompt: {prompts[0]}, output: {output_text}")
+    llm.shutdown()
