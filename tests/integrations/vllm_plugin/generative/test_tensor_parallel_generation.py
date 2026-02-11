@@ -42,9 +42,6 @@ def test_tensor_parallel_generation_n300(model_name: str):
 @pytest.mark.push
 @pytest.mark.tensor_parallel
 @pytest.mark.llmbox
-@pytest.mark.skip(
-    reason="vLLM TP test leave the device in bad state after successful execution; causing subsequent tests to fail. https://github.com/tenstorrent/tt-xla/issues/3266"
-)
 @pytest.mark.parametrize(
     ["model_name", "enable_const_eval", "experimental_enable_weight_bfp8_conversion"],
     [
@@ -79,6 +76,8 @@ def test_tensor_parallel_generation_llmbox_small(
 
     output_text = llm.generate(prompts, sampling_params)[0].outputs[0].text
     print(f"prompt: {prompts[0]}, output: {output_text}")
+    vllm.shutdown()
+    print(f"shutdown completed for model: {model_name}")
 
 
 @pytest.mark.nightly
@@ -118,4 +117,4 @@ def test_tensor_parallel_generation_llmbox_large(
 
     output_text = llm.generate(prompts, sampling_params)[0].outputs[0].text
     print(f"prompt: {prompts[0]}, output: {output_text}")
-    llm.shutdown()
+    vllm.shutdown()
