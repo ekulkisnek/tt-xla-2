@@ -16,14 +16,6 @@ add_library(TTPJRTUtils
     "logging.cc"
 )
 
-target_include_directories(TTPJRTUtils PUBLIC
-    ${PROJECT_SOURCE_DIR}/pjrt_implementation/inc
-    ${PROJECT_SOURCE_DIR}/third_party/loguru/src/loguru-install/include/
-    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/install/include
-    ${PROJECT_SOURCE_DIR}/third_party/pjrt_c_api
-    ${TTMLIR_TOOLCHAIN_DIR}/include
-)
-
 add_dependencies(TTPJRTUtils
     tt-mlir
 )

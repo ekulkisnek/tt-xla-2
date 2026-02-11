@@ -8,10 +8,20 @@
 # https://llvm.org/LICENSE.txt
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+include_directories(
+    ${TTMLIR_TOOLCHAIN_DIR}/src/shardy
+    ${TTMLIR_TOOLCHAIN_DIR}/src/stablehlo
+    ${TTMLIR_TOOLCHAIN_DIR}/include
+    ${PROJECT_SOURCE_DIR}/pjrt_implementation/inc
+    ${PROJECT_SOURCE_DIR}/third_party/loguru/src/loguru-install/include/
+    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/install/include
+    ${PROJECT_SOURCE_DIR}/third_party/pjrt_c_api
+    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal/tt_metal/third_party/tracy/public # Used for tracy zones in PJRT.
+)
+
 add_subdirectory(api)
 add_subdirectory(utils)
-
-include(ExternalProject)
 
 # ----- TTPJRTBindings -----
 # Static lib that implements api bindings logic.
