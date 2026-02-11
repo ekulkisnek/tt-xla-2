@@ -93,7 +93,8 @@ from .attention import (
 from .logger import tt_init_logger
 from .platform import TTConfig
 from .pooling_input_batch import CachedRequestState, InputBatch
-from .vllm_distributed_utils import replace_rmsnorm_modules, shard_model
+from .vllm_distributed_utils import shard_model
+from .overrides import replace_modules
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -1402,7 +1403,7 @@ class TTPoolingModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 ).eval()
-                replace_rmsnorm_modules(model)
+                replace_modules(model)
                 model = model.to(self.device)
 
                 if self.enable_tensor_parallel:
