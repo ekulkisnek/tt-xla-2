@@ -192,6 +192,7 @@ ClientInstance::~ClientInstance() {
   DLOG_F(LOG_DEBUG, "ClientInstance::~ClientInstance");
   closeMeshDevice();
   std::remove(m_cached_system_descriptor_path.data());
+  loguru::flush();
 }
 
 PJRT_Error *ClientInstance::initialize() {
