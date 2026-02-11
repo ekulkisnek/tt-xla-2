@@ -9,7 +9,6 @@ import vllm
 os.environ["TTXLA_LOGGER_LEVEL"] = "DEBUG"
 
 
-@pytest.mark.nightly
 @pytest.mark.push
 @pytest.mark.tensor_parallel
 @pytest.mark.dual_chip
@@ -37,7 +36,6 @@ def test_tensor_parallel_generation_n300(model_name: str):
     print(f"prompt: {prompts[0]}, output: {output_text}")
 
 
-@pytest.mark.nightly
 @pytest.mark.push
 @pytest.mark.tensor_parallel
 @pytest.mark.llmbox
