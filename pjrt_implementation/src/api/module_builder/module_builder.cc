@@ -1117,6 +1117,7 @@ void ModuleBuilder::printModule(mlir::OwningOpRef<mlir::ModuleOp> &mlir_module,
                                 const std::optional<std::string> &export_path,
                                 const std::string &stage_name,
                                 const std::string &model_name) {
+  return;
   if (loguru::g_stderr_verbosity >= LOG_DEBUG) {
     VLOG_F(LOG_DEBUG, "MLIR Module %s:", stage_name.c_str());
     mlir_module->print(llvm::errs(), mlir::OpPrintingFlags().enableDebugInfo());
